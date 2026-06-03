@@ -153,6 +153,11 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, tenant string
 }
 
 func (s *Server) getObject(w http.ResponseWriter, r *http.Request, tenant string, bucket string, key string) {
+	if rangeHeader := strings.TrimSpace(r.Header.Get("Range")); rangeHeader != "" {
+		s.getObjectRange(w, r, tenant, bucket, key, rangeHeader)
+		return
+	}
+
 	manifest, reader, err := s.objects.Open(r.Context(), tenant, bucket, key)
 	if errors.Is(err, metadata.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "NoSuchKey", "the specified key does not exist")
@@ -172,6 +177,48 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, tenant string
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	if _, err := io.Copy(w, reader); err != nil {
+		return
+	}
+}
+
+func (s *Server) getObjectRange(w http.ResponseWriter, r *http.Request, tenant string, bucket string, key string, rangeHeader string) {
+	manifest, err := s.objects.Stat(r.Context(), tenant, bucket, key)
+	if errors.Is(err, metadata.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "NoSuchKey", "the specified key does not exist")
+		return
+	}
+	if err != nil {
+		writeInternalError(w, err)
+		return
+	}
+
+	byteRange, err := parseSingleRange(rangeHeader, manifest.Size)
+	if err != nil {
+		applyObjectHeaders(w, manifest.Headers)
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("ETag", manifest.ETag)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", manifest.Size))
+		writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", err.Error())
+		return
+	}
+
+	length := byteRange.End - byteRange.Start + 1
+	if r.Method == http.MethodHead {
+		applyRangeHeaders(w, manifest, byteRange, length)
+		w.WriteHeader(http.StatusPartialContent)
+		return
+	}
+
+	manifest, reader, err := s.objects.OpenRange(r.Context(), tenant, bucket, key, byteRange)
+	if err != nil {
+		writeInternalError(w, err)
+		return
+	}
+	defer reader.Close()
+
+	applyRangeHeaders(w, manifest, byteRange, length)
+	w.WriteHeader(http.StatusPartialContent)
 	if _, err := io.Copy(w, reader); err != nil {
 		return
 	}
@@ -363,6 +410,74 @@ func applyObjectHeaders(w http.ResponseWriter, headers map[string]string) {
 	for key, value := range headers {
 		w.Header().Set(key, value)
 	}
+}
+
+func applyRangeHeaders(w http.ResponseWriter, manifest metadata.ObjectManifest, byteRange object.ByteRange, length int64) {
+	applyObjectHeaders(w, manifest.Headers)
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("ETag", manifest.ETag)
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", byteRange.Start, byteRange.End, manifest.Size))
+	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+}
+
+func parseSingleRange(header string, size int64) (object.ByteRange, error) {
+	if !strings.HasPrefix(header, "bytes=") {
+		return object.ByteRange{}, fmt.Errorf("only bytes ranges are supported")
+	}
+	spec := strings.TrimSpace(strings.TrimPrefix(header, "bytes="))
+	if spec == "" {
+		return object.ByteRange{}, fmt.Errorf("range is empty")
+	}
+	if strings.Contains(spec, ",") {
+		return object.ByteRange{}, fmt.Errorf("multiple ranges are not supported")
+	}
+	startRaw, endRaw, ok := strings.Cut(spec, "-")
+	if !ok {
+		return object.ByteRange{}, fmt.Errorf("range must include a dash")
+	}
+	startRaw = strings.TrimSpace(startRaw)
+	endRaw = strings.TrimSpace(endRaw)
+	if startRaw == "" && endRaw == "" {
+		return object.ByteRange{}, fmt.Errorf("range is empty")
+	}
+	if size <= 0 {
+		return object.ByteRange{}, fmt.Errorf("range is not satisfiable")
+	}
+
+	if startRaw == "" {
+		suffixLength, err := strconv.ParseInt(endRaw, 10, 64)
+		if err != nil || suffixLength <= 0 {
+			return object.ByteRange{}, fmt.Errorf("suffix length is invalid")
+		}
+		start := size - suffixLength
+		if start < 0 {
+			start = 0
+		}
+		return object.ByteRange{Start: start, End: size - 1}, nil
+	}
+
+	start, err := strconv.ParseInt(startRaw, 10, 64)
+	if err != nil || start < 0 {
+		return object.ByteRange{}, fmt.Errorf("range start is invalid")
+	}
+	if start >= size {
+		return object.ByteRange{}, fmt.Errorf("range is not satisfiable")
+	}
+	if endRaw == "" {
+		return object.ByteRange{Start: start, End: size - 1}, nil
+	}
+
+	end, err := strconv.ParseInt(endRaw, 10, 64)
+	if err != nil || end < 0 {
+		return object.ByteRange{}, fmt.Errorf("range end is invalid")
+	}
+	if end < start {
+		return object.ByteRange{}, fmt.Errorf("range end is before range start")
+	}
+	if end >= size {
+		end = size - 1
+	}
+	return object.ByteRange{Start: start, End: end}, nil
 }
 
 func validateCompletedParts(uploaded map[int]multipart.PartInfo, completed []completePart) ([]int, error) {

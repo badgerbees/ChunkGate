@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -84,6 +85,135 @@ func TestServerPreservesObjectHeaders(t *testing.T) {
 		if got := w.Header().Get(key); got != want {
 			t.Fatalf("%s = %q, want %q", key, got, want)
 		}
+	}
+}
+
+func TestServerHandlesSingleRangeRequests(t *testing.T) {
+	server := testServer(t)
+	payload := "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	putObjectForRangeTest(t, server, payload)
+	total := len(payload)
+
+	for _, tc := range []struct {
+		name         string
+		method       string
+		rangeHeader  string
+		wantStatus   int
+		wantBody     string
+		wantRange    string
+		wantLength   string
+		expectNoBody bool
+	}{
+		{
+			name:        "prefix",
+			method:      http.MethodGet,
+			rangeHeader: "bytes=0-4",
+			wantStatus:  http.StatusPartialContent,
+			wantBody:    payload[0:5],
+			wantRange:   "bytes 0-4/" + strconvItoa(total),
+			wantLength:  "5",
+		},
+		{
+			name:        "middle",
+			method:      http.MethodGet,
+			rangeHeader: "bytes=10-25",
+			wantStatus:  http.StatusPartialContent,
+			wantBody:    payload[10:26],
+			wantRange:   "bytes 10-25/" + strconvItoa(total),
+			wantLength:  "16",
+		},
+		{
+			name:        "suffix",
+			method:      http.MethodGet,
+			rangeHeader: "bytes=-6",
+			wantStatus:  http.StatusPartialContent,
+			wantBody:    payload[total-6:],
+			wantRange:   "bytes 56-61/" + strconvItoa(total),
+			wantLength:  "6",
+		},
+		{
+			name:        "open ended",
+			method:      http.MethodGet,
+			rangeHeader: "bytes=50-",
+			wantStatus:  http.StatusPartialContent,
+			wantBody:    payload[50:],
+			wantRange:   "bytes 50-61/" + strconvItoa(total),
+			wantLength:  "12",
+		},
+		{
+			name:        "full equivalent",
+			method:      http.MethodGet,
+			rangeHeader: "bytes=0-61",
+			wantStatus:  http.StatusPartialContent,
+			wantBody:    payload,
+			wantRange:   "bytes 0-61/" + strconvItoa(total),
+			wantLength:  strconvItoa(total),
+		},
+		{
+			name:         "head",
+			method:       http.MethodHead,
+			rangeHeader:  "bytes=1-3",
+			wantStatus:   http.StatusPartialContent,
+			wantBody:     "",
+			wantRange:    "bytes 1-3/" + strconvItoa(total),
+			wantLength:   "3",
+			expectNoBody: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, "/bucket/range.txt", nil)
+			req.Header.Set("Range", tc.rangeHeader)
+			w := httptest.NewRecorder()
+			server.ServeHTTP(w, req)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
+			}
+			if got := w.Header().Get("Content-Range"); got != tc.wantRange {
+				t.Fatalf("content-range = %q, want %q", got, tc.wantRange)
+			}
+			if got := w.Header().Get("Content-Length"); got != tc.wantLength {
+				t.Fatalf("content-length = %q, want %q", got, tc.wantLength)
+			}
+			if got := w.Body.String(); got != tc.wantBody {
+				t.Fatalf("body = %q, want %q", got, tc.wantBody)
+			}
+			if tc.expectNoBody && w.Body.Len() != 0 {
+				t.Fatalf("HEAD body length = %d, want 0", w.Body.Len())
+			}
+		})
+	}
+}
+
+func TestServerRejectsInvalidAndUnsupportedRanges(t *testing.T) {
+	server := testServer(t)
+	payload := "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	putObjectForRangeTest(t, server, payload)
+
+	for _, tc := range []struct {
+		name        string
+		rangeHeader string
+	}{
+		{name: "invalid order", rangeHeader: "bytes=5-1"},
+		{name: "unsatisfiable", rangeHeader: "bytes=62-"},
+		{name: "multi range", rangeHeader: "bytes=0-1,3-4"},
+		{name: "bad unit", rangeHeader: "items=0-1"},
+		{name: "zero suffix", rangeHeader: "bytes=-0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/bucket/range.txt", nil)
+			req.Header.Set("Range", tc.rangeHeader)
+			w := httptest.NewRecorder()
+			server.ServeHTTP(w, req)
+			if w.Code != http.StatusRequestedRangeNotSatisfiable {
+				t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
+			}
+			if got := w.Header().Get("Content-Range"); got != "bytes */"+strconvItoa(len(payload)) {
+				t.Fatalf("content-range = %q", got)
+			}
+			if !strings.Contains(w.Body.String(), "<Code>InvalidRange</Code>") {
+				t.Fatalf("body = %s, want InvalidRange", w.Body.String())
+			}
+		})
 	}
 }
 
@@ -270,6 +400,16 @@ func testServer(t *testing.T, options ...serverOption) *Server {
 	return NewServer(service, multipart.NewManager(t.TempDir(), limits.NewDiskReservations(1024*1024)), apiOptions...)
 }
 
+func putObjectForRangeTest(t *testing.T, server *Server, payload string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPut, "/bucket/range.txt", strings.NewReader(payload))
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("put status = %d body = %s", w.Code, w.Body.String())
+	}
+}
+
 func withTestAuth(t *testing.T, now time.Time, credentials ...s3auth.Credential) serverOption {
 	t.Helper()
 	verifier, err := s3auth.NewVerifier(credentials)
@@ -367,5 +507,5 @@ func testAWSEncode(value string) string {
 }
 
 func strconvItoa(value int) string {
-	return string(rune('0' + value))
+	return strconv.Itoa(value)
 }

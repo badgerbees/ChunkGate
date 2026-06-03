@@ -29,6 +29,11 @@ type Service struct {
 	cpu     *limits.CPUSemaphore
 }
 
+type ByteRange struct {
+	Start int64
+	End   int64
+}
+
 type PutOptions struct {
 	Headers map[string]string
 }
@@ -110,18 +115,75 @@ func (s *Service) Open(ctx context.Context, tenant string, bucket string, key st
 	if err != nil {
 		return metadata.ObjectManifest{}, nil, err
 	}
+	reader, err := s.openChunks(ctx, tenant, manifest, nil)
+	if err != nil {
+		return metadata.ObjectManifest{}, nil, err
+	}
+	return manifest, reader, nil
+}
+
+func (s *Service) OpenRange(ctx context.Context, tenant string, bucket string, key string, byteRange ByteRange) (metadata.ObjectManifest, io.ReadCloser, error) {
+	manifest, err := s.store.GetObject(ctx, tenant, bucket, key)
+	if err != nil {
+		return metadata.ObjectManifest{}, nil, err
+	}
+	reader, err := s.openChunks(ctx, tenant, manifest, &byteRange)
+	if err != nil {
+		return metadata.ObjectManifest{}, nil, err
+	}
+	return manifest, reader, nil
+}
+
+func (s *Service) Stat(ctx context.Context, tenant string, bucket string, key string) (metadata.ObjectManifest, error) {
+	return s.store.GetObject(ctx, tenant, bucket, key)
+}
+
+func (s *Service) openChunks(ctx context.Context, tenant string, manifest metadata.ObjectManifest, byteRange *ByteRange) (io.ReadCloser, error) {
 	readers := make([]io.Reader, 0, len(manifest.Chunks))
 	closers := make([]io.Closer, 0, len(manifest.Chunks))
 	for _, chunk := range manifest.Chunks {
+		readStart := int64(0)
+		readEnd := chunk.Size - 1
+		if byteRange != nil {
+			chunkStart := chunk.Offset
+			chunkEnd := chunk.Offset + chunk.Size - 1
+			if chunk.Size == 0 || chunkEnd < byteRange.Start || chunkStart > byteRange.End {
+				continue
+			}
+			if byteRange.Start > chunkStart {
+				readStart = byteRange.Start - chunkStart
+			}
+			if byteRange.End < chunkEnd {
+				readEnd = byteRange.End - chunkStart
+			}
+		}
 		reader, err := s.backend.GetBlock(ctx, tenant, chunk.Hash)
 		if err != nil {
 			closeAll(closers)
-			return metadata.ObjectManifest{}, nil, err
+			return nil, err
+		}
+		if readStart != 0 || readEnd != chunk.Size-1 {
+			data, err := io.ReadAll(reader)
+			closeErr := reader.Close()
+			if err != nil {
+				closeAll(closers)
+				return nil, fmt.Errorf("read range chunk: %w", err)
+			}
+			if closeErr != nil {
+				closeAll(closers)
+				return nil, closeErr
+			}
+			if readStart > int64(len(data)) || readEnd >= int64(len(data)) || readStart > readEnd {
+				closeAll(closers)
+				return nil, fmt.Errorf("invalid chunk range for %s", chunk.Hash)
+			}
+			readers = append(readers, bytes.NewReader(data[readStart:readEnd+1]))
+			continue
 		}
 		readers = append(readers, reader)
 		closers = append(closers, reader)
 	}
-	return manifest, multiReadCloser{Reader: io.MultiReader(readers...), closers: closers}, nil
+	return multiReadCloser{Reader: io.MultiReader(readers...), closers: closers}, nil
 }
 
 func (s *Service) Delete(ctx context.Context, tenant string, bucket string, key string) (metadata.ObjectManifest, error) {

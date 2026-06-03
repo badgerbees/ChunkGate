@@ -9,6 +9,7 @@ This repository currently contains the deployable base architecture:
 - Tenant isolation derived from authenticated access keys.
 - Bucket-level SDK compatibility routes for list, create, head, delete, and empty object listings.
 - Object header preservation for common HTTP headers and `x-amz-meta-*` metadata.
+- Single-range `GET` and `HEAD` support with manifest-driven chunk selection.
 - FastCDC-style content-defined chunking with a small-file bypass.
 - Tenant-sharded SQLite metadata files under `data/metadata/tenant_{id}.db`.
 - Tenant-scoped filesystem block storage under `data/backend`.
