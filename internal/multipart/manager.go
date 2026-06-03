@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,6 +16,8 @@ import (
 
 	"github.com/chunkgate/chunkgate/internal/limits"
 )
+
+var ErrUploadNotFound = errors.New("multipart upload not found")
 
 type Manager struct {
 	root         string
@@ -31,6 +34,7 @@ type Session struct {
 	Reserved  int64
 	CreatedAt time.Time
 	Directory string
+	Headers   map[string]string
 	Parts     map[int]PartInfo
 }
 
@@ -49,7 +53,7 @@ func NewManager(root string, reservations *limits.DiskReservations) *Manager {
 	}
 }
 
-func (m *Manager) Create(ctx context.Context, tenant string, bucket string, key string, expectedSize int64) (Session, error) {
+func (m *Manager) Create(ctx context.Context, tenant string, bucket string, key string, expectedSize int64, headers ...map[string]string) (Session, error) {
 	if err := ctx.Err(); err != nil {
 		return Session{}, err
 	}
@@ -74,6 +78,7 @@ func (m *Manager) Create(ctx context.Context, tenant string, bucket string, key 
 		Reserved:  expectedSize,
 		CreatedAt: time.Now().UTC(),
 		Directory: dir,
+		Headers:   firstHeaderMap(headers),
 		Parts:     map[int]PartInfo{},
 	}
 
@@ -162,6 +167,13 @@ func (m *Manager) Open(ctx context.Context, tenant string, uploadID string, orde
 	return session, multiReadCloser{Reader: io.MultiReader(files...), closers: closers}, nil
 }
 
+func (m *Manager) Get(ctx context.Context, tenant string, uploadID string) (Session, error) {
+	if err := ctx.Err(); err != nil {
+		return Session{}, err
+	}
+	return m.session(tenant, uploadID)
+}
+
 func (m *Manager) Abort(ctx context.Context, tenant string, uploadID string) error {
 	session, err := m.session(tenant, uploadID)
 	if err != nil {
@@ -188,16 +200,35 @@ func (m *Manager) session(tenant string, uploadID string) (Session, error) {
 	defer m.mu.Unlock()
 	session := m.sessions[uploadID]
 	if session == nil || session.Tenant != tenant {
-		return Session{}, fmt.Errorf("multipart upload not found")
+		return Session{}, ErrUploadNotFound
 	}
 	return cloneSession(session), nil
 }
 
 func cloneSession(session *Session) Session {
 	clone := *session
+	clone.Headers = cloneStringMap(session.Headers)
 	clone.Parts = make(map[int]PartInfo, len(session.Parts))
 	for number, part := range session.Parts {
 		clone.Parts[number] = part
+	}
+	return clone
+}
+
+func firstHeaderMap(headers []map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	return cloneStringMap(headers[0])
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	clone := make(map[string]string, len(values))
+	for key, value := range values {
+		clone[key] = value
 	}
 	return clone
 }

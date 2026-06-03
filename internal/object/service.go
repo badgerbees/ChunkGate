@@ -29,6 +29,18 @@ type Service struct {
 	cpu     *limits.CPUSemaphore
 }
 
+type PutOptions struct {
+	Headers map[string]string
+}
+
+type PutOption func(*PutOptions)
+
+func WithHeaders(headers map[string]string) PutOption {
+	return func(options *PutOptions) {
+		options.Headers = cloneStringMap(headers)
+	}
+}
+
 func NewService(config Config) *Service {
 	return &Service{
 		chunker: config.Chunker,
@@ -38,7 +50,8 @@ func NewService(config Config) *Service {
 	}
 }
 
-func (s *Service) Put(ctx context.Context, tenant string, bucket string, key string, body io.Reader) (metadata.ObjectManifest, error) {
+func (s *Service) Put(ctx context.Context, tenant string, bucket string, key string, body io.Reader, options ...PutOption) (metadata.ObjectManifest, error) {
+	putOptions := collectPutOptions(options)
 	release, err := s.cpu.Acquire(ctx)
 	if err != nil {
 		return metadata.ObjectManifest{}, err
@@ -78,12 +91,13 @@ func (s *Service) Put(ctx context.Context, tenant string, bucket string, key str
 	}
 
 	manifest := metadata.ObjectManifest{
-		Tenant: tenant,
-		Bucket: bucket,
-		Key:    key,
-		Size:   size,
-		ETag:   `"` + hex.EncodeToString(fullMD5.Sum(nil)) + `"`,
-		Chunks: refs,
+		Tenant:  tenant,
+		Bucket:  bucket,
+		Key:     key,
+		Size:    size,
+		ETag:    `"` + hex.EncodeToString(fullMD5.Sum(nil)) + `"`,
+		Headers: putOptions.Headers,
+		Chunks:  refs,
 	}
 	if err := s.store.CommitObject(ctx, pendingID, manifest); err != nil {
 		return metadata.ObjectManifest{}, err
@@ -150,4 +164,28 @@ func ReadAll(ctx context.Context, reader io.Reader) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func collectPutOptions(options []PutOption) PutOptions {
+	var collected PutOptions
+	for _, option := range options {
+		if option != nil {
+			option(&collected)
+		}
+	}
+	if collected.Headers != nil {
+		collected.Headers = cloneStringMap(collected.Headers)
+	}
+	return collected
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	clone := make(map[string]string, len(values))
+	for key, value := range values {
+		clone[key] = value
+	}
+	return clone
 }

@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
+
+	"github.com/chunkgate/chunkgate/internal/s3auth"
 )
 
 const (
@@ -31,6 +34,7 @@ type Config struct {
 	ChunkMinBytes           int
 	ChunkAvgBytes           int
 	ChunkMaxBytes           int
+	AuthCredentials         []s3auth.Credential
 }
 
 func FromEnv() Config {
@@ -47,6 +51,7 @@ func FromEnv() Config {
 		ChunkMinBytes:           envInt("CHUNKGATE_CHUNK_MIN_BYTES", defaultChunkMin),
 		ChunkAvgBytes:           envInt("CHUNKGATE_CHUNK_AVG_BYTES", defaultChunkAvg),
 		ChunkMaxBytes:           envInt("CHUNKGATE_CHUNK_MAX_BYTES", defaultChunkMax),
+		AuthCredentials:         credentialsFromEnv(),
 	}
 }
 
@@ -74,6 +79,11 @@ func (c Config) Validate() error {
 	}
 	if c.SmallFileThresholdBytes < 0 {
 		return fmt.Errorf("CHUNKGATE_SMALL_FILE_THRESHOLD_BYTES must be >= 0")
+	}
+	for _, credential := range c.AuthCredentials {
+		if credential.AccessKey == "" || credential.SecretKey == "" {
+			return fmt.Errorf("auth credentials must include both access key and secret key")
+		}
 	}
 	return nil
 }
@@ -107,4 +117,38 @@ func envInt64(key string, fallback int64) int64 {
 		return fallback
 	}
 	return parsed
+}
+
+func credentialsFromEnv() []s3auth.Credential {
+	var credentials []s3auth.Credential
+	if accessKey := os.Getenv("CHUNKGATE_ACCESS_KEY_ID"); accessKey != "" {
+		credentials = append(credentials, s3auth.Credential{
+			AccessKey: accessKey,
+			SecretKey: os.Getenv("CHUNKGATE_SECRET_ACCESS_KEY"),
+			Tenant:    envString("CHUNKGATE_TENANT_ID", accessKey),
+		})
+	}
+	spec := os.Getenv("CHUNKGATE_CREDENTIALS")
+	if spec == "" {
+		return credentials
+	}
+	for _, entry := range strings.Split(spec, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		parts := strings.SplitN(entry, ":", 3)
+		credential := s3auth.Credential{AccessKey: strings.TrimSpace(parts[0])}
+		if len(parts) > 1 {
+			credential.SecretKey = strings.TrimSpace(parts[1])
+		}
+		if len(parts) > 2 {
+			credential.Tenant = strings.TrimSpace(parts[2])
+		}
+		if credential.Tenant == "" {
+			credential.Tenant = credential.AccessKey
+		}
+		credentials = append(credentials, credential)
+	}
+	return credentials
 }

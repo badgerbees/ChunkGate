@@ -213,7 +213,18 @@ func objectKey(tenant string, bucket string, key string) string {
 
 func cloneManifest(manifest ObjectManifest) ObjectManifest {
 	manifest.Chunks = append([]ChunkRef(nil), manifest.Chunks...)
+	if manifest.Headers != nil {
+		manifest.Headers = cloneStringMap(manifest.Headers)
+	}
 	return manifest
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	clone := make(map[string]string, len(values))
+	for key, value := range values {
+		clone[key] = value
+	}
+	return clone
 }
 
 func randomID() string {

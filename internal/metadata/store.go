@@ -26,16 +26,17 @@ type ChunkRef struct {
 }
 
 type ObjectManifest struct {
-	ID        string      `json:"id"`
-	Tenant    string      `json:"tenant"`
-	Bucket    string      `json:"bucket"`
-	Key       string      `json:"key"`
-	State     ObjectState `json:"state"`
-	Size      int64       `json:"size"`
-	ETag      string      `json:"etag"`
-	Chunks    []ChunkRef  `json:"chunks"`
-	CreatedAt time.Time   `json:"created_at"`
-	UpdatedAt time.Time   `json:"updated_at"`
+	ID        string            `json:"id"`
+	Tenant    string            `json:"tenant"`
+	Bucket    string            `json:"bucket"`
+	Key       string            `json:"key"`
+	State     ObjectState       `json:"state"`
+	Size      int64             `json:"size"`
+	ETag      string            `json:"etag"`
+	Headers   map[string]string `json:"headers,omitempty"`
+	Chunks    []ChunkRef        `json:"chunks"`
+	CreatedAt time.Time         `json:"created_at"`
+	UpdatedAt time.Time         `json:"updated_at"`
 }
 
 type BlockRef struct {

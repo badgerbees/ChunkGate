@@ -19,6 +19,7 @@ import (
 	"github.com/chunkgate/chunkgate/internal/metadata"
 	"github.com/chunkgate/chunkgate/internal/multipart"
 	"github.com/chunkgate/chunkgate/internal/object"
+	"github.com/chunkgate/chunkgate/internal/s3auth"
 )
 
 func main() {
@@ -58,9 +59,14 @@ func main() {
 		limits.NewDiskReservations(cfg.LocalCapacityBytes),
 	)
 
+	authVerifier, err := s3auth.NewVerifier(cfg.AuthCredentials)
+	if err != nil {
+		log.Fatalf("configure auth: %v", err)
+	}
+
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           api.NewServer(objects, multipartManager),
+		Handler:           api.NewServer(objects, multipartManager, api.WithAuthVerifier(authVerifier)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
