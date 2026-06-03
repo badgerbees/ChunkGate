@@ -64,62 +64,141 @@ func New(options Options) *Splitter {
 }
 
 func (s *Splitter) Split(ctx context.Context, reader io.Reader) ([]Chunk, error) {
-	data, err := io.ReadAll(reader)
+	var chunks []Chunk
+	err := s.Stream(ctx, reader, func(chunk Chunk) error {
+		data := make([]byte, len(chunk.Data))
+		copy(data, chunk.Data)
+		chunks = append(chunks, Chunk{Offset: chunk.Offset, Data: data})
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("read stream: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
 		return nil, err
-	}
-	if len(data) == 0 {
-		return []Chunk{{Offset: 0, Data: nil}}, nil
-	}
-	if s.smallFileThreshold > 0 && len(data) <= s.smallFileThreshold {
-		return []Chunk{{Offset: 0, Data: data}}, nil
-	}
-
-	chunks := make([]Chunk, 0, (len(data)/s.avgSize)+1)
-	for offset := 0; offset < len(data); {
-		end := s.boundary(data, offset)
-		chunk := make([]byte, end-offset)
-		copy(chunk, data[offset:end])
-		chunks = append(chunks, Chunk{Offset: int64(offset), Data: chunk})
-		offset = end
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
 	}
 	return chunks, nil
 }
 
-func (s *Splitter) boundary(data []byte, start int) int {
-	remaining := len(data) - start
-	if remaining <= s.maxSize {
-		if remaining <= s.minSize {
-			return len(data)
+func (s *Splitter) Stream(ctx context.Context, reader io.Reader, emit func(Chunk) error) error {
+	if emit == nil {
+		return fmt.Errorf("emit callback must not be nil")
+	}
+	processor := streamProcessor{
+		splitter: s,
+		emit:     emit,
+		current:  make([]byte, 0, s.maxSize),
+	}
+
+	if s.smallFileThreshold > 0 {
+		prefix, exceeded, err := readSmallPrefix(ctx, reader, s.smallFileThreshold)
+		if err != nil {
+			return err
+		}
+		if !exceeded {
+			return emit(Chunk{Offset: 0, Data: prefix})
+		}
+		if err := processor.write(ctx, prefix); err != nil {
+			return err
 		}
 	}
 
-	minEnd := start + s.minSize
-	if minEnd > len(data) {
-		return len(data)
+	buffer := make([]byte, 32*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, err := reader.Read(buffer)
+		if n > 0 {
+			if writeErr := processor.write(ctx, buffer[:n]); writeErr != nil {
+				return writeErr
+			}
+		}
+		if err == io.EOF {
+			return processor.flush(ctx)
+		}
+		if err != nil {
+			return fmt.Errorf("read stream: %w", err)
+		}
 	}
-	maxEnd := start + s.maxSize
-	if maxEnd > len(data) {
-		maxEnd = len(data)
-	}
+}
 
-	var hash uint64
-	for i := start; i < maxEnd; i++ {
-		hash = (hash << 1) + gearTable[data[i]]
-		if i+1 < minEnd {
+type streamProcessor struct {
+	splitter *Splitter
+	emit     func(Chunk) error
+	offset   int64
+	current  []byte
+	hash     uint64
+	emitted  bool
+}
+
+func (p *streamProcessor) write(ctx context.Context, data []byte) error {
+	for _, b := range data {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		p.current = append(p.current, b)
+		p.hash = (p.hash << 1) + gearTable[b]
+		size := len(p.current)
+		if size < p.splitter.minSize {
 			continue
 		}
-		if hash&s.mask == 0 {
-			return i + 1
+		if size >= p.splitter.maxSize || p.hash&p.splitter.mask == 0 {
+			if err := p.emitCurrent(ctx); err != nil {
+				return err
+			}
 		}
 	}
-	return maxEnd
+	return nil
+}
+
+func (p *streamProcessor) flush(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(p.current) == 0 {
+		if p.emitted {
+			return nil
+		}
+		return p.emit(Chunk{Offset: 0, Data: nil})
+	}
+	return p.emitCurrent(ctx)
+}
+
+func (p *streamProcessor) emitCurrent(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	chunk := Chunk{Offset: p.offset, Data: p.current}
+	if err := p.emit(chunk); err != nil {
+		return err
+	}
+	p.offset += int64(len(p.current))
+	p.current = make([]byte, 0, p.splitter.maxSize)
+	p.hash = 0
+	p.emitted = true
+	return nil
+}
+
+func readSmallPrefix(ctx context.Context, reader io.Reader, threshold int) ([]byte, bool, error) {
+	prefix := make([]byte, 0, minInt(threshold, 64*1024))
+	buffer := make([]byte, 32*1024)
+	for len(prefix) <= threshold {
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+		n, err := reader.Read(buffer)
+		if n > 0 {
+			prefix = append(prefix, buffer[:n]...)
+			if len(prefix) > threshold {
+				return prefix, true, nil
+			}
+		}
+		if err == io.EOF {
+			return prefix, false, nil
+		}
+		if err != nil {
+			return nil, false, fmt.Errorf("read stream: %w", err)
+		}
+	}
+	return prefix, true, nil
 }
 
 func nextPowerOfTwo(n int) int {
@@ -144,4 +223,11 @@ func buildGearTable() [256]uint64 {
 		table[i] = z ^ (z >> 31)
 	}
 	return table
+}
+
+func minInt(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

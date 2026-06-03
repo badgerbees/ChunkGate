@@ -66,6 +66,23 @@ func (s *FileStore) GetBlock(ctx context.Context, tenant string, hash string) (i
 	return file, nil
 }
 
+func (s *FileStore) HasBlock(ctx context.Context, tenant string, hash string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	path, err := s.blockPath(tenant, hash)
+	if err != nil {
+		return false, err
+	}
+	if _, err := os.Stat(path); err == nil {
+		return true, nil
+	} else if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	} else {
+		return false, fmt.Errorf("stat block: %w", err)
+	}
+}
+
 func (s *FileStore) DeleteBlocks(ctx context.Context, tenant string, hashes []string) error {
 	for _, hash := range hashes {
 		if err := ctx.Err(); err != nil {

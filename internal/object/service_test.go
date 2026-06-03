@@ -1,7 +1,9 @@
 package object
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -87,6 +89,51 @@ func TestServiceOpenRangeFetchesOnlyIntersectingChunks(t *testing.T) {
 	}
 }
 
+func TestServicePutStreamsAndSkipsDuplicateChunkWrites(t *testing.T) {
+	ctx := context.Background()
+	blocks := newDedupeBlockStore()
+	service := NewService(Config{
+		Chunker: chunker.New(chunker.Options{MinSize: 4, AvgSize: 4, MaxSize: 4, SmallFileThreshold: 0}),
+		Backend: blocks,
+		Store:   metadata.NewMemoryStore(),
+		CPU:     limits.NewCPUSemaphore(1),
+	})
+
+	manifest, err := service.Put(ctx, "tenant-a", "bucket", "key", strings.NewReader("abcdabcdabcdabcd"))
+	if err != nil {
+		t.Fatalf("put failed: %v", err)
+	}
+	if len(manifest.Chunks) != 4 {
+		t.Fatalf("chunk count = %d, want 4", len(manifest.Chunks))
+	}
+	if blocks.puts != 1 {
+		t.Fatalf("put block calls = %d, want 1", blocks.puts)
+	}
+}
+
+func TestServicePutStopsWhenUploadContextIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	blocks := newDedupeBlockStore()
+	service := NewService(Config{
+		Chunker: chunker.New(chunker.Options{MinSize: 64 * 1024, AvgSize: 128 * 1024, MaxSize: 256 * 1024, SmallFileThreshold: 0}),
+		Backend: blocks,
+		Store:   metadata.NewMemoryStore(),
+		CPU:     limits.NewCPUSemaphore(1),
+	})
+	reader := &cancelAfterFirstRead{remaining: 2 * 1024 * 1024, cancel: cancel}
+
+	_, err := service.Put(ctx, "tenant-a", "bucket", "key", reader)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context canceled", err)
+	}
+	if blocks.puts != 0 {
+		t.Fatalf("put block calls = %d, want 0", blocks.puts)
+	}
+	if _, _, err := service.Open(context.Background(), "tenant-a", "bucket", "key"); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("open after canceled put err = %v, want not found", err)
+	}
+}
+
 type countingBlockStore struct {
 	inner  backend.BlockStore
 	opened []string
@@ -103,4 +150,67 @@ func (s *countingBlockStore) GetBlock(ctx context.Context, tenant string, hash s
 
 func (s *countingBlockStore) DeleteBlocks(ctx context.Context, tenant string, hashes []string) error {
 	return s.inner.DeleteBlocks(ctx, tenant, hashes)
+}
+
+type dedupeBlockStore struct {
+	blocks map[string][]byte
+	puts   int
+}
+
+func newDedupeBlockStore() *dedupeBlockStore {
+	return &dedupeBlockStore{blocks: map[string][]byte{}}
+}
+
+func (s *dedupeBlockStore) PutBlock(ctx context.Context, tenant string, hash string, data []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.puts++
+	copied := make([]byte, len(data))
+	copy(copied, data)
+	s.blocks[tenant+"\x00"+hash] = copied
+	return nil
+}
+
+func (s *dedupeBlockStore) GetBlock(ctx context.Context, tenant string, hash string) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(s.blocks[tenant+"\x00"+hash])), nil
+}
+
+func (s *dedupeBlockStore) DeleteBlocks(ctx context.Context, tenant string, hashes []string) error {
+	for _, hash := range hashes {
+		delete(s.blocks, tenant+"\x00"+hash)
+	}
+	return nil
+}
+
+func (s *dedupeBlockStore) HasBlock(ctx context.Context, tenant string, hash string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	_, ok := s.blocks[tenant+"\x00"+hash]
+	return ok, nil
+}
+
+type cancelAfterFirstRead struct {
+	remaining int
+	cancel    context.CancelFunc
+}
+
+func (r *cancelAfterFirstRead) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	n := len(p)
+	if n > r.remaining {
+		n = r.remaining
+	}
+	for i := 0; i < n; i++ {
+		p[i] = 'x'
+	}
+	r.remaining -= n
+	r.cancel()
+	return n, nil
 }

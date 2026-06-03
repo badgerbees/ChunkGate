@@ -73,18 +73,23 @@ func (s *Service) Put(ctx context.Context, tenant string, bucket string, key str
 	}
 
 	fullMD5 := md5.New()
-	chunks, err := s.chunker.Split(ctx, io.TeeReader(body, fullMD5))
-	if err != nil {
-		return metadata.ObjectManifest{}, err
-	}
-
-	refs := make([]metadata.ChunkRef, 0, len(chunks))
+	refs := make([]metadata.ChunkRef, 0)
 	var size int64
-	for _, chunk := range chunks {
+	seenBlocks := map[string]bool{}
+	err = s.chunker.Stream(ctx, io.TeeReader(body, fullMD5), func(chunk chunker.Chunk) error {
 		hash := sha256.Sum256(chunk.Data)
 		blockID := hex.EncodeToString(hash[:])
-		if err := s.backend.PutBlock(ctx, tenant, blockID, chunk.Data); err != nil {
-			return metadata.ObjectManifest{}, err
+		if !seenBlocks[blockID] {
+			exists, err := s.hasBlock(ctx, tenant, blockID)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				if err := s.backend.PutBlock(ctx, tenant, blockID, chunk.Data); err != nil {
+					return err
+				}
+			}
+			seenBlocks[blockID] = true
 		}
 		ref := metadata.ChunkRef{
 			Hash:   blockID,
@@ -93,6 +98,10 @@ func (s *Service) Put(ctx context.Context, tenant string, bucket string, key str
 		}
 		size += ref.Size
 		refs = append(refs, ref)
+		return nil
+	})
+	if err != nil {
+		return metadata.ObjectManifest{}, err
 	}
 
 	manifest := metadata.ObjectManifest{
@@ -108,6 +117,18 @@ func (s *Service) Put(ctx context.Context, tenant string, bucket string, key str
 		return metadata.ObjectManifest{}, err
 	}
 	return s.store.GetObject(ctx, tenant, bucket, key)
+}
+
+type blockExistenceChecker interface {
+	HasBlock(ctx context.Context, tenant string, hash string) (bool, error)
+}
+
+func (s *Service) hasBlock(ctx context.Context, tenant string, hash string) (bool, error) {
+	checker, ok := s.backend.(blockExistenceChecker)
+	if !ok {
+		return false, nil
+	}
+	return checker.HasBlock(ctx, tenant, hash)
 }
 
 func (s *Service) Open(ctx context.Context, tenant string, bucket string, key string) (metadata.ObjectManifest, io.ReadCloser, error) {
