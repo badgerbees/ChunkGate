@@ -1,0 +1,9 @@
+.git
+.github
+data
+tmp
+chunkgate
+chunkgate.exe
+*.db
+*.db-shm
+*.db-wal

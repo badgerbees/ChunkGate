@@ -1,0 +1,153 @@
+package object
+
+import (
+	"bytes"
+	"context"
+	"crypto/md5"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+
+	"github.com/chunkgate/chunkgate/internal/backend"
+	"github.com/chunkgate/chunkgate/internal/chunker"
+	"github.com/chunkgate/chunkgate/internal/limits"
+	"github.com/chunkgate/chunkgate/internal/metadata"
+)
+
+type Config struct {
+	Chunker *chunker.Splitter
+	Backend backend.BlockStore
+	Store   metadata.Store
+	CPU     *limits.CPUSemaphore
+}
+
+type Service struct {
+	chunker *chunker.Splitter
+	backend backend.BlockStore
+	store   metadata.Store
+	cpu     *limits.CPUSemaphore
+}
+
+func NewService(config Config) *Service {
+	return &Service{
+		chunker: config.Chunker,
+		backend: config.Backend,
+		store:   config.Store,
+		cpu:     config.CPU,
+	}
+}
+
+func (s *Service) Put(ctx context.Context, tenant string, bucket string, key string, body io.Reader) (metadata.ObjectManifest, error) {
+	release, err := s.cpu.Acquire(ctx)
+	if err != nil {
+		return metadata.ObjectManifest{}, err
+	}
+	defer release()
+
+	pendingID, err := s.store.CreatePendingObject(ctx, metadata.ObjectManifest{
+		Tenant: tenant,
+		Bucket: bucket,
+		Key:    key,
+	})
+	if err != nil {
+		return metadata.ObjectManifest{}, err
+	}
+
+	fullMD5 := md5.New()
+	chunks, err := s.chunker.Split(ctx, io.TeeReader(body, fullMD5))
+	if err != nil {
+		return metadata.ObjectManifest{}, err
+	}
+
+	refs := make([]metadata.ChunkRef, 0, len(chunks))
+	var size int64
+	for _, chunk := range chunks {
+		hash := sha256.Sum256(chunk.Data)
+		blockID := hex.EncodeToString(hash[:])
+		if err := s.backend.PutBlock(ctx, tenant, blockID, chunk.Data); err != nil {
+			return metadata.ObjectManifest{}, err
+		}
+		ref := metadata.ChunkRef{
+			Hash:   blockID,
+			Offset: chunk.Offset,
+			Size:   int64(len(chunk.Data)),
+		}
+		size += ref.Size
+		refs = append(refs, ref)
+	}
+
+	manifest := metadata.ObjectManifest{
+		Tenant: tenant,
+		Bucket: bucket,
+		Key:    key,
+		Size:   size,
+		ETag:   `"` + hex.EncodeToString(fullMD5.Sum(nil)) + `"`,
+		Chunks: refs,
+	}
+	if err := s.store.CommitObject(ctx, pendingID, manifest); err != nil {
+		return metadata.ObjectManifest{}, err
+	}
+	return s.store.GetObject(ctx, tenant, bucket, key)
+}
+
+func (s *Service) Open(ctx context.Context, tenant string, bucket string, key string) (metadata.ObjectManifest, io.ReadCloser, error) {
+	manifest, err := s.store.GetObject(ctx, tenant, bucket, key)
+	if err != nil {
+		return metadata.ObjectManifest{}, nil, err
+	}
+	readers := make([]io.Reader, 0, len(manifest.Chunks))
+	closers := make([]io.Closer, 0, len(manifest.Chunks))
+	for _, chunk := range manifest.Chunks {
+		reader, err := s.backend.GetBlock(ctx, tenant, chunk.Hash)
+		if err != nil {
+			closeAll(closers)
+			return metadata.ObjectManifest{}, nil, err
+		}
+		readers = append(readers, reader)
+		closers = append(closers, reader)
+	}
+	return manifest, multiReadCloser{Reader: io.MultiReader(readers...), closers: closers}, nil
+}
+
+func (s *Service) Delete(ctx context.Context, tenant string, bucket string, key string) (metadata.ObjectManifest, error) {
+	return s.store.DeleteObject(ctx, tenant, bucket, key)
+}
+
+func (s *Service) Store() metadata.Store {
+	return s.store
+}
+
+func (s *Service) Backend() backend.BlockStore {
+	return s.backend
+}
+
+type multiReadCloser struct {
+	io.Reader
+	closers []io.Closer
+}
+
+func (m multiReadCloser) Close() error {
+	return closeAll(m.closers)
+}
+
+func closeAll(closers []io.Closer) error {
+	var first error
+	for _, closer := range closers {
+		if err := closer.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+func ReadAll(ctx context.Context, reader io.Reader) ([]byte, error) {
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, reader); err != nil {
+		return nil, fmt.Errorf("read object: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}

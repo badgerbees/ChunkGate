@@ -1,0 +1,10 @@
+data/
+tmp/
+/chunkgate
+/chunkgate.exe
+*.db
+*.db-shm
+*.db-wal
+*.test
+coverage.out
+dist/

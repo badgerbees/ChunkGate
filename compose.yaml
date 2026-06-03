@@ -1,0 +1,16 @@
+services:
+  chunkgate:
+    build: .
+    image: chunkgate:local
+    ports:
+      - "8080:8080"
+    environment:
+      CHUNKGATE_LISTEN: ":8080"
+      CHUNKGATE_DATA_DIR: "/data"
+      CHUNKGATE_LOCAL_CAPACITY_BYTES: "21474836480"
+    volumes:
+      - chunkgate-data:/data
+    restart: unless-stopped
+
+volumes:
+  chunkgate-data:
