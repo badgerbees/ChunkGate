@@ -54,7 +54,7 @@ func TestServiceOpenRangeFetchesOnlyIntersectingChunks(t *testing.T) {
 	ctx := context.Background()
 	blocks := &countingBlockStore{inner: backend.NewFileStore(t.TempDir())}
 	service := NewService(Config{
-		Chunker: chunker.New(chunker.Options{MinSize: 8, AvgSize: 16, MaxSize: 16, SmallFileThreshold: 0}),
+		Chunker: chunker.New(chunker.Options{MinSize: 8, AvgSize: 16, MaxSize: 16, SmallFileThreshold: 0, Engine: chunker.EngineBuiltin}),
 		Backend: blocks,
 		Store:   metadata.NewMemoryStore(),
 		CPU:     limits.NewCPUSemaphore(1),
@@ -93,7 +93,7 @@ func TestServicePutStreamsAndSkipsDuplicateChunkWrites(t *testing.T) {
 	ctx := context.Background()
 	blocks := newDedupeBlockStore()
 	service := NewService(Config{
-		Chunker: chunker.New(chunker.Options{MinSize: 4, AvgSize: 4, MaxSize: 4, SmallFileThreshold: 0}),
+		Chunker: chunker.New(chunker.Options{MinSize: 4, AvgSize: 4, MaxSize: 4, SmallFileThreshold: 0, Engine: chunker.EngineBuiltin}),
 		Backend: blocks,
 		Store:   metadata.NewMemoryStore(),
 		CPU:     limits.NewCPUSemaphore(1),

@@ -18,6 +18,7 @@ import (
 
 	"github.com/chunkgate/chunkgate/internal/backend"
 	"github.com/chunkgate/chunkgate/internal/chunker"
+	"github.com/chunkgate/chunkgate/internal/gc"
 	"github.com/chunkgate/chunkgate/internal/limits"
 	"github.com/chunkgate/chunkgate/internal/metadata"
 	"github.com/chunkgate/chunkgate/internal/multipart"
@@ -375,10 +376,57 @@ func TestServerRejectsMissingAndBadSignatures(t *testing.T) {
 	}
 }
 
+func TestWriteInternalErrorMapsBackendErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "missing block", err: backend.ErrBlockNotFound, wantStatus: http.StatusNotFound, wantCode: "NoSuchKey"},
+		{name: "backend unavailable", err: backend.ErrBackendUnavailable, wantStatus: http.StatusServiceUnavailable, wantCode: "ServiceUnavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			writeInternalError(w, tc.err)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "<Code>"+tc.wantCode+"</Code>") {
+				t.Fatalf("body = %s, want %s", w.Body.String(), tc.wantCode)
+			}
+		})
+	}
+}
+
+func TestServerExposesGCMetrics(t *testing.T) {
+	metrics := gc.NewMetrics()
+	metrics.Observe(gc.Result{ScannedTenants: 2, CandidateBlocks: 3, DeletedBlocks: 1})
+	server := testServer(t, withGCMetrics(metrics))
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d body = %s", w.Code, w.Body.String())
+	}
+	for _, want := range []string{
+		"chunkgate_gc_runs_total 1",
+		"chunkgate_gc_scanned_tenants_total 2",
+		"chunkgate_gc_candidate_blocks_total 3",
+		"chunkgate_gc_deleted_blocks_total 1",
+	} {
+		if !strings.Contains(w.Body.String(), want) {
+			t.Fatalf("metrics body = %s, want %s", w.Body.String(), want)
+		}
+	}
+}
+
 type serverOption func(*serverTestConfig)
 
 type serverTestConfig struct {
-	auth *s3auth.Verifier
+	auth      *s3auth.Verifier
+	gcMetrics *gc.Metrics
 }
 
 func testServer(t *testing.T, options ...serverOption) *Server {
@@ -396,6 +444,9 @@ func testServer(t *testing.T, options ...serverOption) *Server {
 	apiOptions := []Option{}
 	if cfg.auth != nil {
 		apiOptions = append(apiOptions, WithAuthVerifier(cfg.auth))
+	}
+	if cfg.gcMetrics != nil {
+		apiOptions = append(apiOptions, WithGCMetrics(cfg.gcMetrics))
 	}
 	return NewServer(service, multipart.NewManager(t.TempDir(), limits.NewDiskReservations(1024*1024)), apiOptions...)
 }
@@ -419,6 +470,12 @@ func withTestAuth(t *testing.T, now time.Time, credentials ...s3auth.Credential)
 	verifier.Now = func() time.Time { return now }
 	return func(config *serverTestConfig) {
 		config.auth = verifier
+	}
+}
+
+func withGCMetrics(metrics *gc.Metrics) serverOption {
+	return func(config *serverTestConfig) {
+		config.gcMetrics = metrics
 	}
 }
 

@@ -61,6 +61,9 @@ func (s *FileStore) GetBlock(ctx context.Context, tenant string, hash string) (i
 	}
 	file, err := os.Open(path)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: %s", ErrBlockNotFound, hash)
+		}
 		return nil, fmt.Errorf("open block: %w", err)
 	}
 	return file, nil

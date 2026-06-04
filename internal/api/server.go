@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/chunkgate/chunkgate/internal/backend"
+	"github.com/chunkgate/chunkgate/internal/gc"
 	"github.com/chunkgate/chunkgate/internal/metadata"
 	"github.com/chunkgate/chunkgate/internal/multipart"
 	"github.com/chunkgate/chunkgate/internal/object"
@@ -20,6 +22,7 @@ type Server struct {
 	objects   *object.Service
 	multipart *multipart.Manager
 	auth      *s3auth.Verifier
+	gcMetrics *gc.Metrics
 }
 
 type Option func(*Server)
@@ -27,6 +30,12 @@ type Option func(*Server)
 func WithAuthVerifier(verifier *s3auth.Verifier) Option {
 	return func(server *Server) {
 		server.auth = verifier
+	}
+}
+
+func WithGCMetrics(metrics *gc.Metrics) Option {
+	return func(server *Server) {
+		server.gcMetrics = metrics
 	}
 }
 
@@ -44,6 +53,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/healthz" {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
+		return
+	}
+	if r.URL.Path == "/metrics" {
+		s.writeMetrics(w)
 		return
 	}
 
@@ -235,6 +248,10 @@ func (s *Server) deleteObject(w http.ResponseWriter, r *http.Request, tenant str
 func (s *Server) initiateMultipart(w http.ResponseWriter, r *http.Request, tenant string, bucket string, key string) {
 	expected := parseInt64Header(r, "X-ChunkGate-Expected-Size")
 	session, err := s.multipart.Create(r.Context(), tenant, bucket, key, expected, extractObjectHeaders(r.Header))
+	if errors.Is(err, multipart.ErrUploadTooLarge) {
+		writeError(w, http.StatusBadRequest, "EntityTooLarge", "the proposed multipart upload exceeds the configured maximum size")
+		return
+	}
 	if err != nil {
 		writeInternalError(w, err)
 		return
@@ -256,6 +273,10 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, tenant strin
 	part, err := s.multipart.PutPart(r.Context(), tenant, uploadID, number, r.Body)
 	if errors.Is(err, multipart.ErrUploadNotFound) {
 		writeError(w, http.StatusNotFound, "NoSuchUpload", "the specified multipart upload does not exist")
+		return
+	}
+	if errors.Is(err, multipart.ErrPartTooLarge) || errors.Is(err, multipart.ErrUploadTooLarge) {
+		writeError(w, http.StatusBadRequest, "EntityTooLarge", "the uploaded part exceeds the configured multipart size limit")
 		return
 	}
 	if err != nil {
@@ -531,7 +552,29 @@ func writeError(w http.ResponseWriter, status int, code string, message string) 
 }
 
 func writeInternalError(w http.ResponseWriter, err error) {
+	if errors.Is(err, backend.ErrBlockNotFound) {
+		writeError(w, http.StatusNotFound, "NoSuchKey", "the specified key does not exist")
+		return
+	}
+	if errors.Is(err, backend.ErrBackendUnavailable) {
+		writeError(w, http.StatusServiceUnavailable, "ServiceUnavailable", "the storage backend is temporarily unavailable")
+		return
+	}
 	writeError(w, http.StatusInternalServerError, "InternalError", err.Error())
+}
+
+func (s *Server) writeMetrics(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	snapshot := gc.MetricsSnapshot{}
+	if s.gcMetrics != nil {
+		snapshot = s.gcMetrics.Snapshot()
+	}
+	_, _ = fmt.Fprintf(w, "chunkgate_gc_runs_total %d\n", snapshot.Runs)
+	_, _ = fmt.Fprintf(w, "chunkgate_gc_scanned_tenants_total %d\n", snapshot.ScannedTenants)
+	_, _ = fmt.Fprintf(w, "chunkgate_gc_candidate_blocks_total %d\n", snapshot.CandidateBlocks)
+	_, _ = fmt.Fprintf(w, "chunkgate_gc_deleted_blocks_total %d\n", snapshot.DeletedBlocks)
+	_, _ = fmt.Fprintf(w, "chunkgate_gc_failures_total %d\n", snapshot.Failures)
+	_, _ = fmt.Fprintf(w, "chunkgate_gc_last_run_unix_seconds %d\n", snapshot.LastRunUnix)
 }
 
 func parseInt64Header(r *http.Request, key string) int64 {

@@ -2,7 +2,13 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"io"
+)
+
+var (
+	ErrBlockNotFound      = errors.New("backend block not found")
+	ErrBackendUnavailable = errors.New("backend unavailable")
 )
 
 type BlockStore interface {

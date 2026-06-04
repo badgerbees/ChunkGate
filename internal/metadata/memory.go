@@ -9,22 +9,25 @@ import (
 )
 
 type MemoryStore struct {
-	mu      sync.Mutex
-	objects map[string]ObjectManifest
-	index   map[string]string
-	blocks  map[string]map[string]BlockRefCount
+	mu        sync.Mutex
+	objects   map[string]ObjectManifest
+	index     map[string]string
+	blocks    map[string]map[string]BlockRefCount
+	multipart map[string]map[string]MultipartSession
 }
 
 type BlockRefCount struct {
-	Size     int64
-	RefCount int
+	Size      int64
+	RefCount  int
+	UpdatedAt time.Time
 }
 
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		objects: map[string]ObjectManifest{},
-		index:   map[string]string{},
-		blocks:  map[string]map[string]BlockRefCount{},
+		objects:   map[string]ObjectManifest{},
+		index:     map[string]string{},
+		blocks:    map[string]map[string]BlockRefCount{},
+		multipart: map[string]map[string]MultipartSession{},
 	}
 }
 
@@ -124,6 +127,10 @@ func (s *MemoryStore) DeleteObject(ctx context.Context, tenant string, bucket st
 }
 
 func (s *MemoryStore) ListUnreferencedBlocks(ctx context.Context, tenant string, limit int) ([]BlockRef, error) {
+	return s.ListUnreferencedBlocksOlderThan(ctx, tenant, time.Now().UTC(), limit)
+}
+
+func (s *MemoryStore) ListUnreferencedBlocksOlderThan(ctx context.Context, tenant string, before time.Time, limit int) ([]BlockRef, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -136,8 +143,8 @@ func (s *MemoryStore) ListUnreferencedBlocks(ctx context.Context, tenant string,
 	blocks := s.blocks[tenant]
 	refs := make([]BlockRef, 0)
 	for hash, ref := range blocks {
-		if ref.RefCount == 0 {
-			refs = append(refs, BlockRef{Hash: hash, Size: ref.Size})
+		if ref.RefCount == 0 && !ref.UpdatedAt.After(before) {
+			refs = append(refs, BlockRef{Hash: hash, Size: ref.Size, UpdatedAt: ref.UpdatedAt})
 			if len(refs) == limit {
 				break
 			}
@@ -168,11 +175,124 @@ func (s *MemoryStore) ListTenants(ctx context.Context) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tenants := make([]string, 0, len(s.blocks))
+	seen := map[string]bool{}
+	tenants := make([]string, 0, len(s.blocks)+len(s.multipart))
 	for tenant := range s.blocks {
+		seen[tenant] = true
 		tenants = append(tenants, tenant)
 	}
+	for tenant := range s.multipart {
+		if !seen[tenant] {
+			tenants = append(tenants, tenant)
+		}
+	}
 	return tenants, nil
+}
+
+func (s *MemoryStore) CreateMultipartSession(ctx context.Context, session MultipartSession) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if session.CreatedAt.IsZero() {
+		session.CreatedAt = time.Now().UTC()
+	}
+	if session.UpdatedAt.IsZero() {
+		session.UpdatedAt = session.CreatedAt
+	}
+	if session.Parts == nil {
+		session.Parts = map[int]MultipartPart{}
+	}
+	s.ensureTenant(session.Tenant)
+	if s.multipart[session.Tenant] == nil {
+		s.multipart[session.Tenant] = map[string]MultipartSession{}
+	}
+	s.multipart[session.Tenant][session.UploadID] = cloneMultipartSession(session)
+	return nil
+}
+
+func (s *MemoryStore) SaveMultipartPart(ctx context.Context, tenant string, uploadID string, part MultipartPart, reservedBytes int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session, ok := s.multipart[tenant][uploadID]
+	if !ok {
+		return ErrNotFound
+	}
+	if part.CreatedAt.IsZero() {
+		part.CreatedAt = time.Now().UTC()
+	}
+	if session.Parts == nil {
+		session.Parts = map[int]MultipartPart{}
+	}
+	session.Parts[part.Number] = part
+	session.ReservedBytes = reservedBytes
+	session.UpdatedAt = time.Now().UTC()
+	s.multipart[tenant][uploadID] = cloneMultipartSession(session)
+	return nil
+}
+
+func (s *MemoryStore) GetMultipartSession(ctx context.Context, tenant string, uploadID string) (MultipartSession, error) {
+	if err := ctx.Err(); err != nil {
+		return MultipartSession{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session, ok := s.multipart[tenant][uploadID]
+	if !ok {
+		return MultipartSession{}, ErrNotFound
+	}
+	return cloneMultipartSession(session), nil
+}
+
+func (s *MemoryStore) ListMultipartSessions(ctx context.Context, tenant string) ([]MultipartSession, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sessions := make([]MultipartSession, 0, len(s.multipart[tenant]))
+	for _, session := range s.multipart[tenant] {
+		sessions = append(sessions, cloneMultipartSession(session))
+	}
+	return sessions, nil
+}
+
+func (s *MemoryStore) ListStaleMultipartSessions(ctx context.Context, tenant string, before time.Time) ([]MultipartSession, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var sessions []MultipartSession
+	for _, session := range s.multipart[tenant] {
+		if session.CreatedAt.Before(before) {
+			sessions = append(sessions, cloneMultipartSession(session))
+		}
+	}
+	return sessions, nil
+}
+
+func (s *MemoryStore) DeleteMultipartSession(ctx context.Context, tenant string, uploadID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.multipart[tenant][uploadID]; !ok {
+		return ErrNotFound
+	}
+	delete(s.multipart[tenant], uploadID)
+	return nil
 }
 
 func (s *MemoryStore) Close() error {
@@ -187,22 +307,26 @@ func (s *MemoryStore) ensureTenant(tenant string) {
 
 func (s *MemoryStore) incrementLocked(tenant string, chunks []ChunkRef) {
 	s.ensureTenant(tenant)
+	now := time.Now().UTC()
 	for _, chunk := range chunks {
 		ref := s.blocks[tenant][chunk.Hash]
 		ref.Size = chunk.Size
 		ref.RefCount++
+		ref.UpdatedAt = now
 		s.blocks[tenant][chunk.Hash] = ref
 	}
 }
 
 func (s *MemoryStore) decrementLocked(tenant string, chunks []ChunkRef) {
 	s.ensureTenant(tenant)
+	now := time.Now().UTC()
 	for _, chunk := range chunks {
 		ref := s.blocks[tenant][chunk.Hash]
 		if ref.RefCount > 0 {
 			ref.RefCount--
 		}
 		ref.Size = chunk.Size
+		ref.UpdatedAt = now
 		s.blocks[tenant][chunk.Hash] = ref
 	}
 }
@@ -219,7 +343,27 @@ func cloneManifest(manifest ObjectManifest) ObjectManifest {
 	return manifest
 }
 
+func cloneMultipartSession(session MultipartSession) MultipartSession {
+	session.Headers = cloneStringMap(session.Headers)
+	session.Parts = cloneMultipartParts(session.Parts)
+	return session
+}
+
+func cloneMultipartParts(parts map[int]MultipartPart) map[int]MultipartPart {
+	if parts == nil {
+		return nil
+	}
+	clone := make(map[int]MultipartPart, len(parts))
+	for number, part := range parts {
+		clone[number] = part
+	}
+	return clone
+}
+
 func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
 	clone := make(map[string]string, len(values))
 	for key, value := range values {
 		clone[key] = value

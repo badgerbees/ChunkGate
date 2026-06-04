@@ -1,9 +1,12 @@
 package chunker
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+
+	fastcdc "github.com/kalbasit/fastcdc"
 )
 
 const (
@@ -11,6 +14,8 @@ const (
 	DefaultAvgSize            = 1024 * 1024
 	DefaultMaxSize            = 4 * 1024 * 1024
 	DefaultSmallFileThreshold = 5 * 1024 * 1024
+	EngineFastCDC             = "fastcdc"
+	EngineBuiltin             = "builtin"
 )
 
 type Options struct {
@@ -18,6 +23,7 @@ type Options struct {
 	AvgSize            int
 	MaxSize            int
 	SmallFileThreshold int
+	Engine             string
 }
 
 type Chunk struct {
@@ -30,6 +36,7 @@ type Splitter struct {
 	avgSize            int
 	maxSize            int
 	smallFileThreshold int
+	engine             string
 	mask               uint64
 }
 
@@ -54,11 +61,18 @@ func New(options Options) *Splitter {
 	if options.AvgSize > options.MaxSize {
 		options.MaxSize = options.AvgSize
 	}
+	if options.Engine == "" {
+		options.Engine = EngineFastCDC
+	}
+	if options.Engine != EngineFastCDC && options.Engine != EngineBuiltin {
+		options.Engine = EngineFastCDC
+	}
 	return &Splitter{
 		minSize:            options.MinSize,
 		avgSize:            options.AvgSize,
 		maxSize:            options.MaxSize,
 		smallFileThreshold: options.SmallFileThreshold,
+		engine:             options.Engine,
 		mask:               uint64(nextPowerOfTwo(options.AvgSize) - 1),
 	}
 }
@@ -81,23 +95,71 @@ func (s *Splitter) Stream(ctx context.Context, reader io.Reader, emit func(Chunk
 	if emit == nil {
 		return fmt.Errorf("emit callback must not be nil")
 	}
+
+	prefix, exceeded, err := s.readPrefix(ctx, reader)
+	if err != nil {
+		return err
+	}
+	if !exceeded {
+		return emit(Chunk{Offset: 0, Data: prefix})
+	}
+	reader = io.MultiReader(bytes.NewReader(prefix), reader)
+
+	if s.engine == EngineBuiltin {
+		return s.streamBuiltin(ctx, reader, emit)
+	}
+	return s.streamFastCDC(ctx, reader, emit)
+}
+
+func (s *Splitter) readPrefix(ctx context.Context, reader io.Reader) ([]byte, bool, error) {
+	if s.smallFileThreshold > 0 {
+		prefix, exceeded, err := readSmallPrefix(ctx, reader, s.smallFileThreshold)
+		if err != nil {
+			return nil, false, err
+		}
+		return prefix, exceeded, nil
+	}
+	return nil, true, nil
+}
+
+func (s *Splitter) streamFastCDC(ctx context.Context, reader io.Reader, emit func(Chunk) error) error {
+	chunker, err := fastcdc.NewChunker(
+		contextReader{ctx: ctx, reader: reader},
+		fastcdc.WithMinSize(uint32(s.minSize)),
+		fastcdc.WithTargetSize(uint32(s.avgSize)),
+		fastcdc.WithMaxSize(uint32(s.maxSize)),
+		fastcdc.WithBufferSize(32*1024),
+	)
+	if err != nil {
+		return fmt.Errorf("create fastcdc chunker: %w", err)
+	}
+	emitted := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		next, err := chunker.Next()
+		if err == io.EOF {
+			if emitted {
+				return nil
+			}
+			return emit(Chunk{Offset: 0, Data: nil})
+		}
+		if err != nil {
+			return fmt.Errorf("read fastcdc chunk: %w", err)
+		}
+		if err := emit(Chunk{Offset: int64(next.Offset), Data: next.Data}); err != nil {
+			return err
+		}
+		emitted = true
+	}
+}
+
+func (s *Splitter) streamBuiltin(ctx context.Context, reader io.Reader, emit func(Chunk) error) error {
 	processor := streamProcessor{
 		splitter: s,
 		emit:     emit,
 		current:  make([]byte, 0, s.maxSize),
-	}
-
-	if s.smallFileThreshold > 0 {
-		prefix, exceeded, err := readSmallPrefix(ctx, reader, s.smallFileThreshold)
-		if err != nil {
-			return err
-		}
-		if !exceeded {
-			return emit(Chunk{Offset: 0, Data: prefix})
-		}
-		if err := processor.write(ctx, prefix); err != nil {
-			return err
-		}
 	}
 
 	buffer := make([]byte, 32*1024)
@@ -118,6 +180,25 @@ func (s *Splitter) Stream(ctx context.Context, reader io.Reader, emit func(Chunk
 			return fmt.Errorf("read stream: %w", err)
 		}
 	}
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := r.reader.Read(p)
+	if err != nil {
+		return n, err
+	}
+	if ctxErr := r.ctx.Err(); ctxErr != nil {
+		return n, ctxErr
+	}
+	return n, nil
 }
 
 type streamProcessor struct {
