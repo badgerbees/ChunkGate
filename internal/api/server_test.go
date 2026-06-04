@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"github.com/chunkgate/chunkgate/internal/metadata"
 	"github.com/chunkgate/chunkgate/internal/multipart"
 	"github.com/chunkgate/chunkgate/internal/object"
+	"github.com/chunkgate/chunkgate/internal/ops"
 	"github.com/chunkgate/chunkgate/internal/s3auth"
 )
 
@@ -422,11 +424,138 @@ func TestServerExposesGCMetrics(t *testing.T) {
 	}
 }
 
+func TestServerRejectsOversizeObjectBody(t *testing.T) {
+	server := testServer(t, withBodyLimits(4, 0, 0))
+
+	req := httptest.NewRequest(http.MethodPut, "/bucket/too-large.txt", strings.NewReader("12345"))
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "<Code>EntityTooLarge</Code>") {
+		t.Fatalf("body = %s, want EntityTooLarge", w.Body.String())
+	}
+}
+
+func TestServerRejectsUploadsWhileDraining(t *testing.T) {
+	drain := &ops.Drain{}
+	server := testServer(t, withDrain(drain))
+	drain.Start()
+
+	req := httptest.NewRequest(http.MethodPut, "/bucket/key.txt", strings.NewReader("payload"))
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "<Code>ServiceUnavailable</Code>") {
+		t.Fatalf("body = %s, want ServiceUnavailable", w.Body.String())
+	}
+}
+
+func TestServerReadinessChecksDependenciesAndDrainState(t *testing.T) {
+	drain := &ops.Drain{}
+	server := testServer(t, withDrain(drain))
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ready status = %d body = %s", w.Code, w.Body.String())
+	}
+	for _, want := range []string{`"status":"ready"`, `"metadata":"ok"`, `"backend":"ok"`, `"scratch":"ok"`} {
+		if !strings.Contains(w.Body.String(), want) {
+			t.Fatalf("ready body = %s, want %s", w.Body.String(), want)
+		}
+	}
+
+	drain.Start()
+	w = httptest.NewRecorder()
+	server.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("draining ready status = %d body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"status":"not_ready"`) || !strings.Contains(w.Body.String(), `"drain":"draining"`) {
+		t.Fatalf("draining body = %s", w.Body.String())
+	}
+}
+
+func TestServerReadinessReportsBackendFailure(t *testing.T) {
+	path := t.TempDir() + "/not-a-directory"
+	if err := os.WriteFile(path, []byte("file"), 0o644); err != nil {
+		t.Fatalf("create blocking file failed: %v", err)
+	}
+	server := testServer(t, withBackend(backend.NewFileStore(path)))
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"backend"`) {
+		t.Fatalf("body = %s, want backend failure", w.Body.String())
+	}
+}
+
+func TestServerPprofEndpointIsGated(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil)
+	w := httptest.NewRecorder()
+	testServer(t).ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("disabled pprof status = %d", w.Code)
+	}
+
+	w = httptest.NewRecorder()
+	testServer(t, withPprof()).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("enabled pprof status = %d body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestServerExposesOperationalMetrics(t *testing.T) {
+	metrics := ops.NewMetrics()
+	server := testServer(t, withOpsMetrics(metrics))
+
+	put := httptest.NewRequest(http.MethodPut, "/bucket/key.txt", strings.NewReader("payload"))
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, put)
+	if w.Code != http.StatusOK {
+		t.Fatalf("put status = %d body = %s", w.Code, w.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w = httptest.NewRecorder()
+	server.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d body = %s", w.Code, w.Body.String())
+	}
+	for _, want := range []string{
+		"chunkgate_http_requests_total",
+		"chunkgate_uploads_total 1",
+		"chunkgate_uploaded_bytes_total 7",
+		"chunkgate_chunks_total",
+		"chunkgate_chunk_limiter_limit",
+	} {
+		if !strings.Contains(w.Body.String(), want) {
+			t.Fatalf("metrics body = %s, want %s", w.Body.String(), want)
+		}
+	}
+}
+
 type serverOption func(*serverTestConfig)
 
 type serverTestConfig struct {
-	auth      *s3auth.Verifier
-	gcMetrics *gc.Metrics
+	auth       *s3auth.Verifier
+	gcMetrics  *gc.Metrics
+	opsMetrics *ops.Metrics
+	drain      *ops.Drain
+	backend    backend.BlockStore
+	maxObject  int64
+	maxPart    int64
+	maxXML     int64
+	pprof      bool
 }
 
 func testServer(t *testing.T, options ...serverOption) *Server {
@@ -435,18 +564,38 @@ func testServer(t *testing.T, options ...serverOption) *Server {
 	for _, option := range options {
 		option(&cfg)
 	}
+	metrics := cfg.opsMetrics
+	if metrics == nil {
+		metrics = ops.NewMetrics()
+	}
+	limiter := limits.NewAdaptiveCPUSemaphore(2, 0)
+	blocks := cfg.backend
+	if blocks == nil {
+		blocks = backend.NewFileStore(t.TempDir())
+	}
 	service := object.NewService(object.Config{
 		Chunker: chunker.New(chunker.Options{MinSize: 4, AvgSize: 8, MaxSize: 16, SmallFileThreshold: 0}),
-		Backend: backend.NewFileStore(t.TempDir()),
+		Backend: blocks,
 		Store:   metadata.NewMemoryStore(),
-		CPU:     limits.NewCPUSemaphore(2),
+		CPU:     limiter,
+		Metrics: metrics,
 	})
-	apiOptions := []Option{}
+	apiOptions := []Option{
+		WithMetrics(metrics),
+		WithLimiter(limiter),
+		WithBodyLimits(cfg.maxObject, cfg.maxPart, cfg.maxXML),
+	}
 	if cfg.auth != nil {
 		apiOptions = append(apiOptions, WithAuthVerifier(cfg.auth))
 	}
 	if cfg.gcMetrics != nil {
 		apiOptions = append(apiOptions, WithGCMetrics(cfg.gcMetrics))
+	}
+	if cfg.drain != nil {
+		apiOptions = append(apiOptions, WithDrain(cfg.drain))
+	}
+	if cfg.pprof {
+		apiOptions = append(apiOptions, WithPprof(true))
 	}
 	return NewServer(service, multipart.NewManager(t.TempDir(), limits.NewDiskReservations(1024*1024)), apiOptions...)
 }
@@ -476,6 +625,38 @@ func withTestAuth(t *testing.T, now time.Time, credentials ...s3auth.Credential)
 func withGCMetrics(metrics *gc.Metrics) serverOption {
 	return func(config *serverTestConfig) {
 		config.gcMetrics = metrics
+	}
+}
+
+func withOpsMetrics(metrics *ops.Metrics) serverOption {
+	return func(config *serverTestConfig) {
+		config.opsMetrics = metrics
+	}
+}
+
+func withDrain(drain *ops.Drain) serverOption {
+	return func(config *serverTestConfig) {
+		config.drain = drain
+	}
+}
+
+func withBackend(blocks backend.BlockStore) serverOption {
+	return func(config *serverTestConfig) {
+		config.backend = blocks
+	}
+}
+
+func withBodyLimits(maxObject int64, maxPart int64, maxXML int64) serverOption {
+	return func(config *serverTestConfig) {
+		config.maxObject = maxObject
+		config.maxPart = maxPart
+		config.maxXML = maxXML
+	}
+}
+
+func withPprof() serverOption {
+	return func(config *serverTestConfig) {
+		config.pprof = true
 	}
 }
 

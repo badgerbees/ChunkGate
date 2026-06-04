@@ -378,6 +378,27 @@ func (s *SQLiteStore) ListTenants(ctx context.Context) ([]string, error) {
 	return tenants, nil
 }
 
+func (s *SQLiteStore) HealthCheck(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(s.resolver.Root, 0o755); err != nil {
+		return fmt.Errorf("check sqlite metadata root: %w", err)
+	}
+	s.mu.Lock()
+	dbs := make([]*sql.DB, 0, len(s.dbs))
+	for _, db := range s.dbs {
+		dbs = append(dbs, db)
+	}
+	s.mu.Unlock()
+	for _, db := range dbs {
+		if err := db.PingContext(ctx); err != nil {
+			return fmt.Errorf("ping sqlite metadata shard: %w", err)
+		}
+	}
+	return nil
+}
+
 func (s *SQLiteStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -662,6 +683,7 @@ func loadMultipartParts(ctx context.Context, db rowQuerier, uploadID string) (ma
 
 type rowQuerier interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
 func loadObjectChunks(ctx context.Context, db rowQuerier, objectID string) ([]ChunkRef, error) {

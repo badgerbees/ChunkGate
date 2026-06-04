@@ -102,6 +102,16 @@ func (s *FileStore) DeleteBlocks(ctx context.Context, tenant string, hashes []st
 	return nil
 }
 
+func (s *FileStore) HealthCheck(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(s.root, 0o755); err != nil {
+		return fmt.Errorf("check filesystem backend root: %w", err)
+	}
+	return nil
+}
+
 func (s *FileStore) blockPath(tenant string, hash string) (string, error) {
 	safeTenant := sanitizePathPart(tenant)
 	if len(hash) < 2 || strings.Contains(hash, string(filepath.Separator)) || strings.Contains(hash, "..") {

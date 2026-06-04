@@ -29,6 +29,7 @@ const defaultMaxPartSize = int64(5 * 1024 * 1024 * 1024)
 type Manager struct {
 	root          string
 	reservations  *limits.DiskReservations
+	disk          *limits.DiskGuard
 	store         metadata.Store
 	maxPartSize   int64
 	maxUploadSize int64
@@ -83,6 +84,12 @@ func WithMaxUploadSize(bytes int64) Option {
 	}
 }
 
+func WithDiskGuard(guard *limits.DiskGuard) Option {
+	return func(manager *Manager) {
+		manager.disk = guard
+	}
+}
+
 func NewManager(root string, reservations *limits.DiskReservations, options ...Option) *Manager {
 	manager := &Manager{
 		root:         root,
@@ -108,17 +115,21 @@ func (m *Manager) Create(ctx context.Context, tenant string, bucket string, key 
 	if m.maxUploadSize > 0 && expectedSize > m.maxUploadSize {
 		return Session{}, ErrUploadTooLarge
 	}
-	if m.reservations != nil {
-		if err := m.reservations.TryReserve(expectedSize); err != nil {
+	if err := os.MkdirAll(m.root, 0o755); err != nil {
+		return Session{}, fmt.Errorf("create multipart scratch root: %w", err)
+	}
+	if err := m.checkDisk(ctx, 0); err != nil {
+		return Session{}, err
+	}
+	if expectedSize > 0 {
+		if err := m.reserve(ctx, expectedSize); err != nil {
 			return Session{}, err
 		}
 	}
 	uploadID := randomUploadID()
 	dir := m.sessionDirectory(tenant, uploadID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		if m.reservations != nil {
-			m.reservations.Release(expectedSize)
-		}
+		m.release(expectedSize)
 		return Session{}, fmt.Errorf("create multipart scratch directory: %w", err)
 	}
 	session := &Session{
@@ -144,9 +155,7 @@ func (m *Manager) Create(ctx context.Context, tenant string, bucket string, key 
 			UpdatedAt:     session.CreatedAt,
 			Parts:         map[int]metadata.MultipartPart{},
 		}); err != nil {
-			if m.reservations != nil {
-				m.reservations.Release(expectedSize)
-			}
+			m.release(expectedSize)
 			_ = os.RemoveAll(dir)
 			return Session{}, err
 		}
@@ -156,6 +165,36 @@ func (m *Manager) Create(ctx context.Context, tenant string, bucket string, key 
 	m.sessions[sessionKey(tenant, uploadID)] = session
 	m.mu.Unlock()
 	return cloneSession(session), nil
+}
+
+func (m *Manager) CheckPart(ctx context.Context, tenant string, uploadID string, number int, expectedSize int64) error {
+	if expectedSize <= 0 {
+		return nil
+	}
+	if number <= 0 {
+		return fmt.Errorf("part number must be positive")
+	}
+	if m.maxPartSize > 0 && expectedSize > m.maxPartSize {
+		return ErrPartTooLarge
+	}
+	session, err := m.session(ctx, tenant, uploadID)
+	if err != nil {
+		return err
+	}
+	total := expectedSize
+	for partNumber, part := range session.Parts {
+		if partNumber != number {
+			total += part.Size
+		}
+	}
+	if m.maxUploadSize > 0 && total > m.maxUploadSize {
+		return ErrUploadTooLarge
+	}
+	delta := total - session.Reserved
+	if delta <= 0 {
+		return nil
+	}
+	return m.checkDisk(ctx, delta)
 }
 
 func (m *Manager) PutPart(ctx context.Context, tenant string, uploadID string, number int, reader io.Reader) (PartInfo, error) {
@@ -170,6 +209,9 @@ func (m *Manager) PutPart(ctx context.Context, tenant string, uploadID string, n
 	tmp := path + ".tmp"
 
 	if err := ctx.Err(); err != nil {
+		return PartInfo{}, err
+	}
+	if err := m.checkDisk(ctx, 0); err != nil {
 		return PartInfo{}, err
 	}
 	file, err := os.Create(tmp)
@@ -301,7 +343,7 @@ func (m *Manager) LoadActive(ctx context.Context) error {
 			if err := os.MkdirAll(session.Directory, 0o755); err != nil {
 				return fmt.Errorf("create multipart scratch directory: %w", err)
 			}
-			if err := m.reserve(session.Reserved); err != nil {
+			if err := m.reserve(ctx, session.Reserved); err != nil {
 				return fmt.Errorf("reserve multipart upload %s: %w", session.UploadID, err)
 			}
 			m.mu.Lock()
@@ -384,7 +426,7 @@ func (m *Manager) session(ctx context.Context, tenant string, uploadID string) (
 		return Session{}, err
 	}
 	session := m.sessionFromMetadata(stored)
-	if err := m.reserve(session.Reserved); err != nil {
+	if err := m.reserve(ctx, session.Reserved); err != nil {
 		return Session{}, err
 	}
 
@@ -445,7 +487,7 @@ func (m *Manager) reserveForPart(ctx context.Context, tenant string, uploadID st
 	}
 	delta := total - session.Reserved
 	if delta > 0 {
-		if err := m.reserve(delta); err != nil {
+		if err := m.reserve(ctx, delta); err != nil {
 			return partReservation{}, err
 		}
 	}
@@ -483,17 +525,42 @@ func (m *Manager) finishReservation(reservation partReservation) {
 	}
 }
 
-func (m *Manager) reserve(bytes int64) error {
-	if m.reservations == nil {
+func (m *Manager) reserve(ctx context.Context, bytes int64) error {
+	if bytes <= 0 {
 		return nil
 	}
-	return m.reservations.TryReserve(bytes)
+	if m.disk != nil {
+		return m.disk.TryReserve(ctx, bytes)
+	}
+	if m.reservations != nil {
+		return m.reservations.TryReserve(bytes)
+	}
+	return nil
+}
+
+func (m *Manager) checkDisk(ctx context.Context, bytes int64) error {
+	if bytes <= 0 || m.disk == nil {
+		return nil
+	}
+	return m.disk.Check(ctx, bytes)
 }
 
 func (m *Manager) release(bytes int64) {
-	if m.reservations != nil {
+	if m.disk != nil {
+		m.disk.Release(bytes)
+	} else if m.reservations != nil {
 		m.reservations.Release(bytes)
 	}
+}
+
+func (m *Manager) HealthCheck(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(m.root, 0o755); err != nil {
+		return fmt.Errorf("check multipart scratch root: %w", err)
+	}
+	return m.checkDisk(ctx, 0)
 }
 
 func (m *Manager) sessionFromMetadata(session metadata.MultipartSession) Session {

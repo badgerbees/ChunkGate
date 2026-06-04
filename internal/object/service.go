@@ -13,20 +13,23 @@ import (
 	"github.com/chunkgate/chunkgate/internal/chunker"
 	"github.com/chunkgate/chunkgate/internal/limits"
 	"github.com/chunkgate/chunkgate/internal/metadata"
+	"github.com/chunkgate/chunkgate/internal/ops"
 )
 
 type Config struct {
 	Chunker *chunker.Splitter
 	Backend backend.BlockStore
 	Store   metadata.Store
-	CPU     *limits.CPUSemaphore
+	CPU     limits.ConcurrencyLimiter
+	Metrics *ops.Metrics
 }
 
 type Service struct {
 	chunker *chunker.Splitter
 	backend backend.BlockStore
 	store   metadata.Store
-	cpu     *limits.CPUSemaphore
+	cpu     limits.ConcurrencyLimiter
+	metrics *ops.Metrics
 }
 
 type ByteRange struct {
@@ -52,14 +55,19 @@ func NewService(config Config) *Service {
 		backend: config.Backend,
 		store:   config.Store,
 		cpu:     config.CPU,
+		metrics: config.Metrics,
 	}
 }
 
 func (s *Service) Put(ctx context.Context, tenant string, bucket string, key string, body io.Reader, options ...PutOption) (metadata.ObjectManifest, error) {
 	putOptions := collectPutOptions(options)
-	release, err := s.cpu.Acquire(ctx)
-	if err != nil {
-		return metadata.ObjectManifest{}, err
+	release := func() {}
+	if s.cpu != nil {
+		var err error
+		release, err = s.cpu.Acquire(ctx)
+		if err != nil {
+			return metadata.ObjectManifest{}, err
+		}
 	}
 	defer release()
 
@@ -75,6 +83,7 @@ func (s *Service) Put(ctx context.Context, tenant string, bucket string, key str
 	fullMD5 := md5.New()
 	refs := make([]metadata.ChunkRef, 0)
 	var size int64
+	var chunks int64
 	seenBlocks := map[string]bool{}
 	err = s.chunker.Stream(ctx, io.TeeReader(body, fullMD5), func(chunk chunker.Chunk) error {
 		hash := sha256.Sum256(chunk.Data)
@@ -97,6 +106,7 @@ func (s *Service) Put(ctx context.Context, tenant string, bucket string, key str
 			Size:   int64(len(chunk.Data)),
 		}
 		size += ref.Size
+		chunks++
 		refs = append(refs, ref)
 		return nil
 	})
@@ -115,6 +125,9 @@ func (s *Service) Put(ctx context.Context, tenant string, bucket string, key str
 	}
 	if err := s.store.CommitObject(ctx, pendingID, manifest); err != nil {
 		return metadata.ObjectManifest{}, err
+	}
+	if s.metrics != nil {
+		s.metrics.ObserveUpload(size, chunks)
 	}
 	return s.store.GetObject(ctx, tenant, bucket, key)
 }

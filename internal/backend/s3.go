@@ -194,6 +194,20 @@ func (s *S3Store) DeleteBlocks(ctx context.Context, tenant string, hashes []stri
 	return wrapS3Error("delete blocks", tenant, err)
 }
 
+func (s *S3Store) HealthCheck(ctx context.Context) error {
+	err := s.withRetry(ctx, func(ctx context.Context) error {
+		exists, err := s.client.BucketExists(ctx, s.bucket)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return minio.ErrorResponse{Code: "NoSuchBucket", BucketName: s.bucket}
+		}
+		return nil
+	})
+	return wrapS3Error("check bucket", s.bucket, err)
+}
+
 func (s *S3Store) blockKey(tenant string, hash string) (string, error) {
 	if len(hash) < 2 || strings.Contains(hash, "/") || strings.Contains(hash, "\\") || strings.Contains(hash, "..") {
 		return "", fmt.Errorf("invalid block hash %q", hash)

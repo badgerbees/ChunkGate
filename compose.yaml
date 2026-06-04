@@ -17,6 +17,24 @@ services:
       retries: 20
     restart: unless-stopped
 
+  postgres:
+    image: postgres:17-alpine
+    profiles: ["postgres"]
+    ports:
+      - "15432:5432"
+    environment:
+      POSTGRES_USER: "chunkgate"
+      POSTGRES_PASSWORD: "chunkgate"
+      POSTGRES_DB: "chunkgate"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chunkgate -d chunkgate"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
   create-bucket:
     image: quay.io/minio/mc:latest
     depends_on:
@@ -53,3 +71,4 @@ services:
 volumes:
   chunkgate-data:
   minio-data:
+  postgres-data:

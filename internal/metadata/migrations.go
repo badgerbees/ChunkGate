@@ -84,6 +84,86 @@ var sqliteMigrations = []Migration{
 	},
 }
 
+var postgresMigrations = []Migration{
+	{
+		Version: 1,
+		Name:    "tenant scoped structured metadata schema",
+		Statements: []string{
+			`CREATE TABLE IF NOT EXISTS objects (
+				tenant_id TEXT NOT NULL,
+				id TEXT NOT NULL,
+				bucket TEXT NOT NULL,
+				key TEXT NOT NULL,
+				state TEXT NOT NULL CHECK (state IN ('pending', 'committed', 'deleted', 'failed')),
+				size BIGINT NOT NULL DEFAULT 0 CHECK (size >= 0),
+				etag TEXT NOT NULL DEFAULT '',
+				headers_json TEXT NOT NULL DEFAULT '{}',
+				created_at TIMESTAMPTZ NOT NULL,
+				updated_at TIMESTAMPTZ NOT NULL,
+				PRIMARY KEY (tenant_id, id)
+			)`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS objects_committed_key
+				ON objects(tenant_id, bucket, key) WHERE state = 'committed'`,
+			`CREATE INDEX IF NOT EXISTS objects_state_updated
+				ON objects(tenant_id, state, updated_at)`,
+			`CREATE INDEX IF NOT EXISTS objects_bucket_key_state
+				ON objects(tenant_id, bucket, key, state)`,
+			`CREATE TABLE IF NOT EXISTS blocks (
+				tenant_id TEXT NOT NULL,
+				hash TEXT NOT NULL,
+				backend_key TEXT NOT NULL,
+				size BIGINT NOT NULL CHECK (size >= 0),
+				ref_count BIGINT NOT NULL CHECK (ref_count >= 0),
+				created_at TIMESTAMPTZ NOT NULL,
+				updated_at TIMESTAMPTZ NOT NULL,
+				PRIMARY KEY (tenant_id, hash)
+			)`,
+			`CREATE INDEX IF NOT EXISTS blocks_ref_count_updated
+				ON blocks(tenant_id, ref_count, updated_at)`,
+			`CREATE TABLE IF NOT EXISTS object_chunks (
+				tenant_id TEXT NOT NULL,
+				object_id TEXT NOT NULL,
+				sequence_order BIGINT NOT NULL CHECK (sequence_order >= 0),
+				chunk_hash TEXT NOT NULL,
+				chunk_offset BIGINT NOT NULL CHECK (chunk_offset >= 0),
+				chunk_size BIGINT NOT NULL CHECK (chunk_size >= 0),
+				backend_key TEXT NOT NULL,
+				PRIMARY KEY (tenant_id, object_id, sequence_order),
+				FOREIGN KEY (tenant_id, object_id) REFERENCES objects(tenant_id, id) ON DELETE CASCADE,
+				FOREIGN KEY (tenant_id, chunk_hash) REFERENCES blocks(tenant_id, hash)
+			)`,
+			`CREATE INDEX IF NOT EXISTS object_chunks_hash
+				ON object_chunks(tenant_id, chunk_hash)`,
+			`CREATE INDEX IF NOT EXISTS object_chunks_object_offset
+				ON object_chunks(tenant_id, object_id, chunk_offset)`,
+			`CREATE TABLE IF NOT EXISTS multipart_sessions (
+				tenant_id TEXT NOT NULL,
+				upload_id TEXT NOT NULL,
+				bucket TEXT NOT NULL,
+				key TEXT NOT NULL,
+				headers_json TEXT NOT NULL DEFAULT '{}',
+				reserved_bytes BIGINT NOT NULL DEFAULT 0 CHECK (reserved_bytes >= 0),
+				created_at TIMESTAMPTZ NOT NULL,
+				updated_at TIMESTAMPTZ NOT NULL,
+				PRIMARY KEY (tenant_id, upload_id)
+			)`,
+			`CREATE INDEX IF NOT EXISTS multipart_sessions_created
+				ON multipart_sessions(tenant_id, created_at)`,
+			`CREATE TABLE IF NOT EXISTS multipart_parts (
+				tenant_id TEXT NOT NULL,
+				upload_id TEXT NOT NULL,
+				part_number INTEGER NOT NULL CHECK (part_number > 0),
+				local_scratch_path TEXT NOT NULL,
+				size_bytes BIGINT NOT NULL CHECK (size_bytes >= 0),
+				etag TEXT NOT NULL,
+				created_at TIMESTAMPTZ NOT NULL,
+				PRIMARY KEY (tenant_id, upload_id, part_number),
+				FOREIGN KEY (tenant_id, upload_id) REFERENCES multipart_sessions(tenant_id, upload_id) ON DELETE CASCADE
+			)`,
+		},
+	},
+}
+
 func runMigrations(ctx context.Context, db *sql.DB) error {
 	pragmas := []string{
 		`PRAGMA foreign_keys = ON`,
@@ -113,6 +193,31 @@ func runMigrations(ctx context.Context, db *sql.DB) error {
 			continue
 		}
 		if err := applyMigration(ctx, db, migration); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func runPostgresMigrations(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`); err != nil {
+		return fmt.Errorf("create postgres schema migrations table: %w", err)
+	}
+
+	applied, err := appliedMigrations(ctx, db)
+	if err != nil {
+		return err
+	}
+	for _, migration := range postgresMigrations {
+		if applied[migration.Version] {
+			continue
+		}
+		if err := applyPostgresMigration(ctx, db, migration); err != nil {
 			return err
 		}
 	}
@@ -157,6 +262,27 @@ func applyMigration(ctx context.Context, db *sql.DB, migration Migration) error 
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit migration %d: %w", migration.Version, err)
+	}
+	return nil
+}
+
+func applyPostgresMigration(ctx context.Context, db *sql.DB, migration Migration) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin postgres migration %d: %w", migration.Version, err)
+	}
+	defer tx.Rollback()
+
+	for _, statement := range migration.Statements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("apply postgres migration %d %s: %w", migration.Version, migration.Name, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, name) VALUES ($1, $2)`, migration.Version, migration.Name); err != nil {
+		return fmt.Errorf("record postgres migration %d: %w", migration.Version, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit postgres migration %d: %w", migration.Version, err)
 	}
 	return nil
 }

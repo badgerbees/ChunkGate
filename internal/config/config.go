@@ -21,10 +21,14 @@ const (
 	defaultChunkAvg     = 1024 * 1024
 	defaultChunkMax     = 4 * 1024 * 1024
 	defaultChunkWorkers = 0
+	defaultCPUHeadroom  = 1
 	defaultChunkEngine  = "fastcdc"
+	defaultMetadata     = "sqlite"
 	defaultPartMax      = int64(5 * 1024 * 1024 * 1024)
 	defaultStaleTTL     = 24 * time.Hour
 	defaultBackend      = "filesystem"
+	defaultScratchFree  = int64(1024 * 1024 * 1024)
+	defaultCompleteXML  = int64(1024 * 1024)
 	defaultS3Region     = "us-east-1"
 	defaultS3UseTLS     = true
 	defaultS3PathStyle  = true
@@ -35,17 +39,24 @@ const (
 	defaultGCMinAge     = 24 * time.Hour
 	defaultGCBatchSize  = 1000
 	defaultGCRetries    = 3
+	defaultPGMaxOpen    = 16
+	defaultPGMaxIdle    = 4
+	defaultPGLifetime   = 30 * time.Minute
+	defaultReadyTimeout = 3 * time.Second
+	defaultShutdown     = 15 * time.Second
 )
 
 type Config struct {
 	ListenAddr              string
 	DataDir                 string
+	MetadataProvider        string
 	MetadataDir             string
 	BackendDir              string
 	ScratchDir              string
 	BackendProvider         string
 	LocalCapacityBytes      int64
 	MaxConcurrentChunkers   int
+	CPUHeadroomCores        int
 	SmallFileThresholdBytes int
 	ChunkMinBytes           int
 	ChunkAvgBytes           int
@@ -54,6 +65,9 @@ type Config struct {
 	MultipartMaxPartBytes   int64
 	MultipartMaxUploadBytes int64
 	MultipartStaleTTL       time.Duration
+	ScratchMinFreeBytes     int64
+	MaxObjectBytes          int64
+	CompleteXMLMaxBytes     int64
 	S3Endpoint              string
 	S3Region                string
 	S3Bucket                string
@@ -70,6 +84,13 @@ type Config struct {
 	GCMinOrphanAge          time.Duration
 	GCBatchSize             int
 	GCMaxRetries            int
+	PostgresDSN             string
+	PostgresMaxOpenConns    int
+	PostgresMaxIdleConns    int
+	PostgresConnMaxLifetime time.Duration
+	ReadinessTimeout        time.Duration
+	ShutdownTimeout         time.Duration
+	DebugPprofEnabled       bool
 	AuthCredentials         []s3auth.Credential
 }
 
@@ -78,12 +99,14 @@ func FromEnv() Config {
 	return Config{
 		ListenAddr:              envString("CHUNKGATE_LISTEN", defaultListen),
 		DataDir:                 dataDir,
+		MetadataProvider:        envString("CHUNKGATE_METADATA", defaultMetadata),
 		MetadataDir:             envString("CHUNKGATE_METADATA_DIR", filepath.Join(dataDir, "metadata")),
 		BackendDir:              envString("CHUNKGATE_BACKEND_DIR", filepath.Join(dataDir, "backend")),
 		ScratchDir:              envString("CHUNKGATE_SCRATCH_DIR", filepath.Join(dataDir, "scratch")),
 		BackendProvider:         envString("CHUNKGATE_BACKEND", defaultBackend),
 		LocalCapacityBytes:      envInt64("CHUNKGATE_LOCAL_CAPACITY_BYTES", defaultLocalCap),
 		MaxConcurrentChunkers:   envInt("CHUNKGATE_MAX_CONCURRENT_CHUNKERS", defaultChunkWorkers),
+		CPUHeadroomCores:        envInt("CHUNKGATE_CPU_HEADROOM_CORES", defaultCPUHeadroom),
 		SmallFileThresholdBytes: envInt("CHUNKGATE_SMALL_FILE_THRESHOLD_BYTES", defaultSmallBypass),
 		ChunkMinBytes:           envInt("CHUNKGATE_CHUNK_MIN_BYTES", defaultChunkMin),
 		ChunkAvgBytes:           envInt("CHUNKGATE_CHUNK_AVG_BYTES", defaultChunkAvg),
@@ -92,6 +115,9 @@ func FromEnv() Config {
 		MultipartMaxPartBytes:   envInt64("CHUNKGATE_MULTIPART_MAX_PART_BYTES", defaultPartMax),
 		MultipartMaxUploadBytes: envInt64("CHUNKGATE_MULTIPART_MAX_UPLOAD_BYTES", defaultLocalCap),
 		MultipartStaleTTL:       envDurationSeconds("CHUNKGATE_MULTIPART_STALE_TTL_SECONDS", defaultStaleTTL),
+		ScratchMinFreeBytes:     envInt64("CHUNKGATE_SCRATCH_MIN_FREE_BYTES", defaultScratchFree),
+		MaxObjectBytes:          envInt64("CHUNKGATE_MAX_OBJECT_BYTES", 0),
+		CompleteXMLMaxBytes:     envInt64("CHUNKGATE_COMPLETE_XML_MAX_BYTES", defaultCompleteXML),
 		S3Endpoint:              envString("CHUNKGATE_S3_ENDPOINT", ""),
 		S3Region:                envString("CHUNKGATE_S3_REGION", defaultS3Region),
 		S3Bucket:                envString("CHUNKGATE_S3_BUCKET", ""),
@@ -108,6 +134,13 @@ func FromEnv() Config {
 		GCMinOrphanAge:          envDurationSeconds("CHUNKGATE_GC_MIN_ORPHAN_AGE_SECONDS", defaultGCMinAge),
 		GCBatchSize:             envInt("CHUNKGATE_GC_BATCH_SIZE", defaultGCBatchSize),
 		GCMaxRetries:            envInt("CHUNKGATE_GC_MAX_RETRIES", defaultGCRetries),
+		PostgresDSN:             envString("CHUNKGATE_POSTGRES_DSN", ""),
+		PostgresMaxOpenConns:    envInt("CHUNKGATE_POSTGRES_MAX_OPEN_CONNS", defaultPGMaxOpen),
+		PostgresMaxIdleConns:    envInt("CHUNKGATE_POSTGRES_MAX_IDLE_CONNS", defaultPGMaxIdle),
+		PostgresConnMaxLifetime: envDurationSeconds("CHUNKGATE_POSTGRES_CONN_MAX_LIFETIME_SECONDS", defaultPGLifetime),
+		ReadinessTimeout:        envDurationSeconds("CHUNKGATE_READINESS_TIMEOUT_SECONDS", defaultReadyTimeout),
+		ShutdownTimeout:         envDurationSeconds("CHUNKGATE_SHUTDOWN_TIMEOUT_SECONDS", defaultShutdown),
+		DebugPprofEnabled:       envBool("CHUNKGATE_DEBUG_PPROF_ENABLED", false),
 		AuthCredentials:         credentialsFromEnv(),
 	}
 }
@@ -116,8 +149,17 @@ func (c Config) Validate() error {
 	if c.ListenAddr == "" {
 		return fmt.Errorf("CHUNKGATE_LISTEN must not be empty")
 	}
-	if c.MetadataDir == "" || c.BackendDir == "" || c.ScratchDir == "" {
-		return fmt.Errorf("metadata, backend, and scratch directories must be set")
+	if c.MetadataProvider != "sqlite" && c.MetadataProvider != "postgres" {
+		return fmt.Errorf("CHUNKGATE_METADATA must be sqlite or postgres")
+	}
+	if c.MetadataProvider == "sqlite" && c.MetadataDir == "" {
+		return fmt.Errorf("CHUNKGATE_METADATA_DIR must be set when CHUNKGATE_METADATA=sqlite")
+	}
+	if c.MetadataProvider == "postgres" && c.PostgresDSN == "" {
+		return fmt.Errorf("CHUNKGATE_POSTGRES_DSN is required when CHUNKGATE_METADATA=postgres")
+	}
+	if c.BackendDir == "" || c.ScratchDir == "" {
+		return fmt.Errorf("backend and scratch directories must be set")
 	}
 	if c.BackendProvider != "filesystem" && c.BackendProvider != "s3" {
 		return fmt.Errorf("CHUNKGATE_BACKEND must be filesystem or s3")
@@ -127,6 +169,9 @@ func (c Config) Validate() error {
 	}
 	if c.MaxConcurrentChunkers < 0 {
 		return fmt.Errorf("CHUNKGATE_MAX_CONCURRENT_CHUNKERS must be >= 0")
+	}
+	if c.CPUHeadroomCores < 0 {
+		return fmt.Errorf("CHUNKGATE_CPU_HEADROOM_CORES must be >= 0")
 	}
 	if c.MaxConcurrentChunkers > runtime.NumCPU()*8 {
 		return fmt.Errorf("CHUNKGATE_MAX_CONCURRENT_CHUNKERS is unexpectedly high")
@@ -154,6 +199,15 @@ func (c Config) Validate() error {
 	}
 	if c.MultipartStaleTTL < 0 {
 		return fmt.Errorf("CHUNKGATE_MULTIPART_STALE_TTL_SECONDS must be >= 0")
+	}
+	if c.ScratchMinFreeBytes < 0 {
+		return fmt.Errorf("CHUNKGATE_SCRATCH_MIN_FREE_BYTES must be >= 0")
+	}
+	if c.MaxObjectBytes < 0 {
+		return fmt.Errorf("CHUNKGATE_MAX_OBJECT_BYTES must be >= 0")
+	}
+	if c.CompleteXMLMaxBytes < 0 {
+		return fmt.Errorf("CHUNKGATE_COMPLETE_XML_MAX_BYTES must be >= 0")
 	}
 	if c.BackendProvider == "s3" {
 		if c.S3Endpoint == "" {
@@ -186,6 +240,24 @@ func (c Config) Validate() error {
 	}
 	if c.GCMaxRetries < 0 {
 		return fmt.Errorf("CHUNKGATE_GC_MAX_RETRIES must be >= 0")
+	}
+	if c.PostgresMaxOpenConns < 0 {
+		return fmt.Errorf("CHUNKGATE_POSTGRES_MAX_OPEN_CONNS must be >= 0")
+	}
+	if c.PostgresMaxIdleConns < 0 {
+		return fmt.Errorf("CHUNKGATE_POSTGRES_MAX_IDLE_CONNS must be >= 0")
+	}
+	if c.PostgresMaxOpenConns > 0 && c.PostgresMaxIdleConns > c.PostgresMaxOpenConns {
+		return fmt.Errorf("CHUNKGATE_POSTGRES_MAX_IDLE_CONNS must be <= CHUNKGATE_POSTGRES_MAX_OPEN_CONNS")
+	}
+	if c.PostgresConnMaxLifetime < 0 {
+		return fmt.Errorf("CHUNKGATE_POSTGRES_CONN_MAX_LIFETIME_SECONDS must be >= 0")
+	}
+	if c.ReadinessTimeout < 0 {
+		return fmt.Errorf("CHUNKGATE_READINESS_TIMEOUT_SECONDS must be >= 0")
+	}
+	if c.ShutdownTimeout < 0 {
+		return fmt.Errorf("CHUNKGATE_SHUTDOWN_TIMEOUT_SECONDS must be >= 0")
 	}
 	for _, credential := range c.AuthCredentials {
 		if credential.AccessKey == "" || credential.SecretKey == "" {

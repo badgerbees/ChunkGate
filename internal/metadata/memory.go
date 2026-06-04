@@ -299,6 +299,10 @@ func (s *MemoryStore) Close() error {
 	return nil
 }
 
+func (s *MemoryStore) HealthCheck(ctx context.Context) error {
+	return ctx.Err()
+}
+
 func (s *MemoryStore) ensureTenant(tenant string) {
 	if s.blocks[tenant] == nil {
 		s.blocks[tenant] = map[string]BlockRefCount{}

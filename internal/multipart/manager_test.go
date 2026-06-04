@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -188,6 +189,31 @@ func TestManagerRejectsUploadOverConfiguredLimit(t *testing.T) {
 	}
 	if len(loaded.Parts) != 1 {
 		t.Fatalf("parts = %#v, want only first part", loaded.Parts)
+	}
+}
+
+func TestManagerCheckPartRejectsInsufficientScratchSpaceBeforeSpooling(t *testing.T) {
+	ctx := context.Background()
+	scratchRoot := t.TempDir()
+	reservations := limits.NewDiskReservations(1024)
+	guard := limits.NewDiskGuard(scratchRoot, reservations, 0)
+	manager := NewManager(
+		scratchRoot,
+		reservations,
+		WithDiskGuard(guard),
+		WithMaxPartSize(1024),
+		WithMaxUploadSize(1024),
+	)
+	session, err := manager.Create(ctx, "tenant-a", "bucket", "key", 0)
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	guard.MinFreeBytes = math.MaxInt64
+	if err := manager.CheckPart(ctx, "tenant-a", session.UploadID, 1, 10); !errors.Is(err, limits.ErrInsufficientDisk) {
+		t.Fatalf("check part err = %v, want insufficient disk", err)
+	}
+	if reservations.Used() != 0 {
+		t.Fatalf("reservations = %d, want 0 after failed preflight", reservations.Used())
 	}
 }
 
