@@ -180,6 +180,13 @@ func ensureMinIOBucket(t *testing.T, ctx context.Context, endpoint string, secur
 		return
 	}
 	if err := client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{Region: region}); err != nil {
+		created, checkErr := client.BucketExists(ctx, bucket)
+		if checkErr != nil {
+			t.Fatalf("make minio bucket failed: %v; recheck bucket failed: %v", err, checkErr)
+		}
+		if created {
+			return
+		}
 		t.Fatalf("make minio bucket failed: %v", err)
 	}
 }

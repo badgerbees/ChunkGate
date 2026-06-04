@@ -86,7 +86,13 @@ func TestS3StoreIntegrationMinIO(t *testing.T) {
 	}
 	if !exists {
 		if err := client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{Region: region}); err != nil {
-			t.Fatalf("make bucket failed: %v", err)
+			created, checkErr := client.BucketExists(ctx, bucket)
+			if checkErr != nil {
+				t.Fatalf("make bucket failed: %v; recheck bucket failed: %v", err, checkErr)
+			}
+			if !created {
+				t.Fatalf("make bucket failed: %v", err)
+			}
 		}
 	}
 
