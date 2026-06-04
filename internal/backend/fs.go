@@ -1,7 +1,10 @@
 package backend
 
 import (
+	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -12,12 +15,27 @@ import (
 	"strings"
 )
 
+const encryptedBlockMagic = "CGFSENC1"
+
 type FileStore struct {
 	root string
+	aead cipher.AEAD
 }
 
 func NewFileStore(root string) *FileStore {
 	return &FileStore{root: root}
+}
+
+func NewEncryptedFileStore(root string, key []byte) (*FileStore, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("configure filesystem block encryption: %w", err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("configure filesystem block encryption: %w", err)
+	}
+	return &FileStore{root: root, aead: aead}, nil
 }
 
 func (s *FileStore) PutBlock(ctx context.Context, tenant string, hash string, data []byte) error {
@@ -36,8 +54,12 @@ func (s *FileStore) PutBlock(ctx context.Context, tenant string, hash string, da
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create block directory: %w", err)
 	}
+	payload, err := s.encodeBlock(data)
+	if err != nil {
+		return err
+	}
 	tmp := path + "." + randomSuffix() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, payload, blockFileMode(s.aead != nil)); err != nil {
 		return fmt.Errorf("write block: %w", err)
 	}
 	if _, err := os.Stat(path); err == nil {
@@ -66,7 +88,22 @@ func (s *FileStore) GetBlock(ctx context.Context, tenant string, hash string) (i
 		}
 		return nil, fmt.Errorf("open block: %w", err)
 	}
-	return file, nil
+	if s.aead == nil {
+		return file, nil
+	}
+	data, err := io.ReadAll(file)
+	closeErr := file.Close()
+	if err != nil {
+		return nil, fmt.Errorf("read encrypted block: %w", err)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close encrypted block: %w", closeErr)
+	}
+	plaintext, err := s.decodeBlock(data)
+	if err != nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(plaintext)), nil
 }
 
 func (s *FileStore) HasBlock(ctx context.Context, tenant string, hash string) (bool, error) {
@@ -114,10 +151,80 @@ func (s *FileStore) HealthCheck(ctx context.Context) error {
 
 func (s *FileStore) blockPath(tenant string, hash string) (string, error) {
 	safeTenant := sanitizePathPart(tenant)
-	if len(hash) < 2 || strings.Contains(hash, string(filepath.Separator)) || strings.Contains(hash, "..") {
+	if !validBlockHash(hash) {
 		return "", fmt.Errorf("invalid block hash %q", hash)
 	}
-	return filepath.Join(s.root, "tenants", safeTenant, "blocks", hash[:2], hash), nil
+	path := filepath.Join(s.root, "tenants", safeTenant, "blocks", hash[:2], hash)
+	root, err := filepath.Abs(s.root)
+	if err != nil {
+		return "", fmt.Errorf("resolve backend root: %w", err)
+	}
+	target, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve block path: %w", err)
+	}
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return "", fmt.Errorf("verify block path: %w", err)
+	}
+	if rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("invalid block path")
+	}
+	return target, nil
+}
+
+func (s *FileStore) encodeBlock(data []byte) ([]byte, error) {
+	if s.aead == nil {
+		return data, nil
+	}
+	nonce := make([]byte, s.aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("create block encryption nonce: %w", err)
+	}
+	payload := make([]byte, 0, len(encryptedBlockMagic)+len(nonce)+len(data)+s.aead.Overhead())
+	payload = append(payload, encryptedBlockMagic...)
+	payload = append(payload, nonce...)
+	payload = s.aead.Seal(payload, nonce, data, nil)
+	return payload, nil
+}
+
+func (s *FileStore) decodeBlock(data []byte) ([]byte, error) {
+	if s.aead == nil {
+		return data, nil
+	}
+	prefixLen := len(encryptedBlockMagic) + s.aead.NonceSize()
+	if len(data) < prefixLen || !bytes.Equal(data[:len(encryptedBlockMagic)], []byte(encryptedBlockMagic)) {
+		return nil, fmt.Errorf("encrypted block is missing ChunkGate encryption header")
+	}
+	nonce := data[len(encryptedBlockMagic):prefixLen]
+	ciphertext := data[prefixLen:]
+	plaintext, err := s.aead.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt block: %w", err)
+	}
+	return plaintext, nil
+}
+
+func validBlockHash(hash string) bool {
+	if len(hash) != 64 {
+		return false
+	}
+	for _, r := range hash {
+		switch {
+		case r >= 'a' && r <= 'f':
+		case r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func blockFileMode(encrypted bool) os.FileMode {
+	if encrypted {
+		return 0o600
+	}
+	return 0o644
 }
 
 func sanitizePathPart(value string) string {

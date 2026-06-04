@@ -378,6 +378,111 @@ func TestServerRejectsMissingAndBadSignatures(t *testing.T) {
 	}
 }
 
+func TestServerRequiresAuthenticationUnlessAnonymousTenantIsConfigured(t *testing.T) {
+	server := testServer(t, withoutAnonymousTenant())
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "<Code>AccessDenied</Code>") {
+		t.Fatalf("body = %s, want AccessDenied", w.Body.String())
+	}
+}
+
+func TestServerRejectsInvalidBucketAndObjectNames(t *testing.T) {
+	server := testServer(t)
+
+	for _, tc := range []struct {
+		name     string
+		method   string
+		path     string
+		wantCode string
+	}{
+		{name: "short bucket", method: http.MethodGet, path: "/aa/key", wantCode: "InvalidBucketName"},
+		{name: "uppercase bucket", method: http.MethodGet, path: "/BadBucket/key", wantCode: "InvalidBucketName"},
+		{name: "ip bucket", method: http.MethodGet, path: "/127.0.0.1/key", wantCode: "InvalidBucketName"},
+		{name: "nul key", method: http.MethodPut, path: "/bucket/%00bad", wantCode: "InvalidObjectName"},
+		{name: "control key", method: http.MethodPut, path: "/bucket/%1Fbad", wantCode: "InvalidObjectName"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader("payload"))
+			w := httptest.NewRecorder()
+			server.ServeHTTP(w, req)
+			if w.Code == http.StatusOK || w.Code == http.StatusNoContent {
+				t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "<Code>"+tc.wantCode+"</Code>") {
+				t.Fatalf("body = %s, want %s", w.Body.String(), tc.wantCode)
+			}
+		})
+	}
+}
+
+func TestServerRejectsInvalidMultipartUploadIDsAndPartNumbers(t *testing.T) {
+	server := testServer(t)
+
+	for _, tc := range []struct {
+		name     string
+		method   string
+		path     string
+		body     string
+		status   int
+		wantCode string
+	}{
+		{
+			name:     "bad upload id on part",
+			method:   http.MethodPut,
+			path:     "/bucket/key?uploadId=../escape&partNumber=1",
+			status:   http.StatusNotFound,
+			wantCode: "NoSuchUpload",
+		},
+		{
+			name:     "zero part",
+			method:   http.MethodPut,
+			path:     "/bucket/key?uploadId=0123456789abcdef0123456789abcdef&partNumber=0",
+			status:   http.StatusBadRequest,
+			wantCode: "InvalidPart",
+		},
+		{
+			name:     "part above s3 limit",
+			method:   http.MethodPut,
+			path:     "/bucket/key?uploadId=0123456789abcdef0123456789abcdef&partNumber=10001",
+			status:   http.StatusBadRequest,
+			wantCode: "InvalidPart",
+		},
+		{
+			name:     "non canonical part",
+			method:   http.MethodPut,
+			path:     "/bucket/key?uploadId=0123456789abcdef0123456789abcdef&partNumber=+1",
+			status:   http.StatusBadRequest,
+			wantCode: "InvalidPart",
+		},
+		{
+			name:     "bad upload id on complete",
+			method:   http.MethodPost,
+			path:     "/bucket/key?uploadId=UPPERCASE0123456789abcdef0123",
+			body:     `<CompleteMultipartUpload></CompleteMultipartUpload>`,
+			status:   http.StatusNotFound,
+			wantCode: "NoSuchUpload",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			w := httptest.NewRecorder()
+			server.ServeHTTP(w, req)
+			if w.Code != tc.status {
+				t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "<Code>"+tc.wantCode+"</Code>") {
+				t.Fatalf("body = %s, want %s", w.Body.String(), tc.wantCode)
+			}
+		})
+	}
+}
+
 func TestWriteInternalErrorMapsBackendErrors(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -556,6 +661,7 @@ type serverTestConfig struct {
 	maxPart    int64
 	maxXML     int64
 	pprof      bool
+	anonymous  *string
 }
 
 func testServer(t *testing.T, options ...serverOption) *Server {
@@ -584,6 +690,13 @@ func testServer(t *testing.T, options ...serverOption) *Server {
 		WithMetrics(metrics),
 		WithLimiter(limiter),
 		WithBodyLimits(cfg.maxObject, cfg.maxPart, cfg.maxXML),
+	}
+	anonymousTenant := "default"
+	if cfg.anonymous != nil {
+		anonymousTenant = *cfg.anonymous
+	}
+	if anonymousTenant != "" {
+		apiOptions = append(apiOptions, WithAnonymousTenant(anonymousTenant))
 	}
 	if cfg.auth != nil {
 		apiOptions = append(apiOptions, WithAuthVerifier(cfg.auth))
@@ -657,6 +770,13 @@ func withBodyLimits(maxObject int64, maxPart int64, maxXML int64) serverOption {
 func withPprof() serverOption {
 	return func(config *serverTestConfig) {
 		config.pprof = true
+	}
+}
+
+func withoutAnonymousTenant() serverOption {
+	return func(config *serverTestConfig) {
+		empty := ""
+		config.anonymous = &empty
 	}
 }
 

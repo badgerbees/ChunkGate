@@ -16,11 +16,11 @@ import (
 
 func TestS3StoreBlockKeyUsesTenantIsolatedPrefix(t *testing.T) {
 	store := &S3Store{prefix: cleanS3Prefix("chunkgate/root")}
-	key, err := store.blockKey("tenant/a", "0123456789abcdef")
+	key, err := store.blockKey("tenant/a", testBlockHash)
 	if err != nil {
 		t.Fatalf("block key failed: %v", err)
 	}
-	if key != "chunkgate/root/tenants/tenant_a/blocks/01/0123456789abcdef" {
+	if key != "chunkgate/root/tenants/tenant_a/blocks/01/"+testBlockHash {
 		t.Fatalf("key = %q", key)
 	}
 }
@@ -106,7 +106,7 @@ func TestS3StoreIntegrationMinIO(t *testing.T) {
 		t.Fatalf("create s3 store failed: %v", err)
 	}
 
-	hash := "0123456789abcdef0123456789abcdef"
+	hash := testBlockHash
 	if ok, err := store.HasBlock(ctx, "tenant-a", hash); err != nil || ok {
 		t.Fatalf("initial has block ok=%v err=%v, want false nil", ok, err)
 	}

@@ -57,7 +57,7 @@ func TestServerWithS3BackendMinIO(t *testing.T) {
 		Backend: blocks,
 		Store:   store,
 		CPU:     limits.NewCPUSemaphore(2),
-	}), multipart.NewManager(t.TempDir(), limits.NewDiskReservations(1024*1024)))
+	}), multipart.NewManager(t.TempDir(), limits.NewDiskReservations(1024*1024)), WithAnonymousTenant("default"))
 
 	payload := strings.Repeat("0123456789abcdef", 8)
 	put := httptest.NewRequest(http.MethodPut, "/live/object.txt", strings.NewReader(payload))

@@ -32,6 +32,33 @@ func TestValidateRejectsUnknownMetadataProvider(t *testing.T) {
 	}
 }
 
+func TestValidateRequiresCredentialsUnlessAnonymousModeIsExplicit(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.AuthAllowAnonymous = false
+	cfg.AuthCredentials = nil
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected credentials to be required when anonymous mode is disabled")
+	}
+
+	cfg.AuthAllowAnonymous = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("anonymous local config failed validation: %v", err)
+	}
+}
+
+func TestValidateChecksLocalBlockEncryptionKey(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.LocalBlockEncryptionKey = "short"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid encryption key to fail")
+	}
+
+	cfg.LocalBlockEncryptionKey = "0123456789abcdef0123456789abcdef"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid encryption key failed validation: %v", err)
+	}
+}
+
 func TestValidateRejectsInvalidOperationalGuardrails(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -71,5 +98,6 @@ func validTestConfig() Config {
 		PostgresMaxOpenConns:    4,
 		PostgresMaxIdleConns:    2,
 		PostgresConnMaxLifetime: 1,
+		AuthAllowAnonymous:      true,
 	}
 }

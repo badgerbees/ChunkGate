@@ -9,7 +9,11 @@ import (
 
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (s3auth.Identity, bool) {
 	if s.auth == nil || !s.auth.Enabled() {
-		return s3auth.Identity{Tenant: "default"}, true
+		if s.anonymousTenant != "" {
+			return s3auth.Identity{Tenant: s.anonymousTenant}, true
+		}
+		writeError(w, http.StatusForbidden, "AccessDenied", "authentication is required")
+		return s3auth.Identity{}, false
 	}
 	identity, err := s.auth.Verify(r)
 	if err == nil {

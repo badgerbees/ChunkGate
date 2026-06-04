@@ -1,6 +1,8 @@
 package config
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -29,6 +31,7 @@ const (
 	defaultBackend      = "filesystem"
 	defaultScratchFree  = int64(1024 * 1024 * 1024)
 	defaultCompleteXML  = int64(1024 * 1024)
+	defaultAuthAnon     = false
 	defaultS3Region     = "us-east-1"
 	defaultS3UseTLS     = true
 	defaultS3PathStyle  = true
@@ -54,6 +57,7 @@ type Config struct {
 	BackendDir              string
 	ScratchDir              string
 	BackendProvider         string
+	LocalBlockEncryptionKey string
 	LocalCapacityBytes      int64
 	MaxConcurrentChunkers   int
 	CPUHeadroomCores        int
@@ -91,6 +95,7 @@ type Config struct {
 	ReadinessTimeout        time.Duration
 	ShutdownTimeout         time.Duration
 	DebugPprofEnabled       bool
+	AuthAllowAnonymous      bool
 	AuthCredentials         []s3auth.Credential
 }
 
@@ -104,6 +109,7 @@ func FromEnv() Config {
 		BackendDir:              envString("CHUNKGATE_BACKEND_DIR", filepath.Join(dataDir, "backend")),
 		ScratchDir:              envString("CHUNKGATE_SCRATCH_DIR", filepath.Join(dataDir, "scratch")),
 		BackendProvider:         envString("CHUNKGATE_BACKEND", defaultBackend),
+		LocalBlockEncryptionKey: envString("CHUNKGATE_LOCAL_BLOCK_ENCRYPTION_KEY", ""),
 		LocalCapacityBytes:      envInt64("CHUNKGATE_LOCAL_CAPACITY_BYTES", defaultLocalCap),
 		MaxConcurrentChunkers:   envInt("CHUNKGATE_MAX_CONCURRENT_CHUNKERS", defaultChunkWorkers),
 		CPUHeadroomCores:        envInt("CHUNKGATE_CPU_HEADROOM_CORES", defaultCPUHeadroom),
@@ -141,6 +147,7 @@ func FromEnv() Config {
 		ReadinessTimeout:        envDurationSeconds("CHUNKGATE_READINESS_TIMEOUT_SECONDS", defaultReadyTimeout),
 		ShutdownTimeout:         envDurationSeconds("CHUNKGATE_SHUTDOWN_TIMEOUT_SECONDS", defaultShutdown),
 		DebugPprofEnabled:       envBool("CHUNKGATE_DEBUG_PPROF_ENABLED", false),
+		AuthAllowAnonymous:      envBool("CHUNKGATE_ALLOW_ANONYMOUS", defaultAuthAnon),
 		AuthCredentials:         credentialsFromEnv(),
 	}
 }
@@ -163,6 +170,14 @@ func (c Config) Validate() error {
 	}
 	if c.BackendProvider != "filesystem" && c.BackendProvider != "s3" {
 		return fmt.Errorf("CHUNKGATE_BACKEND must be filesystem or s3")
+	}
+	if c.LocalBlockEncryptionKey != "" && c.BackendProvider != "filesystem" {
+		return fmt.Errorf("CHUNKGATE_LOCAL_BLOCK_ENCRYPTION_KEY is only supported when CHUNKGATE_BACKEND=filesystem")
+	}
+	if c.LocalBlockEncryptionKey != "" {
+		if _, err := DecodeLocalBlockEncryptionKey(c.LocalBlockEncryptionKey); err != nil {
+			return err
+		}
 	}
 	if c.LocalCapacityBytes < 0 {
 		return fmt.Errorf("CHUNKGATE_LOCAL_CAPACITY_BYTES must be >= 0")
@@ -259,6 +274,9 @@ func (c Config) Validate() error {
 	if c.ShutdownTimeout < 0 {
 		return fmt.Errorf("CHUNKGATE_SHUTDOWN_TIMEOUT_SECONDS must be >= 0")
 	}
+	if !c.AuthAllowAnonymous && len(c.AuthCredentials) == 0 {
+		return fmt.Errorf("configure CHUNKGATE_CREDENTIALS or set CHUNKGATE_ALLOW_ANONYMOUS=true for local development")
+	}
 	for _, credential := range c.AuthCredentials {
 		if credential.AccessKey == "" || credential.SecretKey == "" {
 			return fmt.Errorf("auth credentials must include both access key and secret key")
@@ -272,6 +290,30 @@ func envString(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func DecodeLocalBlockEncryptionKey(value string) ([]byte, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	candidates := [][]byte{[]byte(value)}
+	if decoded, err := base64.StdEncoding.DecodeString(value); err == nil {
+		candidates = append(candidates, decoded)
+	}
+	if decoded, err := base64.RawStdEncoding.DecodeString(value); err == nil {
+		candidates = append(candidates, decoded)
+	}
+	if decoded, err := hex.DecodeString(value); err == nil {
+		candidates = append(candidates, decoded)
+	}
+	for _, candidate := range candidates {
+		switch len(candidate) {
+		case 16, 24, 32:
+			return candidate, nil
+		}
+	}
+	return nil, fmt.Errorf("CHUNKGATE_LOCAL_BLOCK_ENCRYPTION_KEY must decode to a 16, 24, or 32 byte AES key")
 }
 
 func envInt(key string, fallback int) int {

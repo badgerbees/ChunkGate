@@ -121,9 +121,7 @@ func main() {
 	}
 
 	drain := &ops.Drain{}
-	handler := api.NewServer(
-		objects,
-		multipartManager,
+	apiOptions := []api.Option{
 		api.WithAuthVerifier(authVerifier),
 		api.WithGCMetrics(gcMetrics),
 		api.WithMetrics(metrics),
@@ -133,7 +131,11 @@ func main() {
 		api.WithBodyLimits(cfg.MaxObjectBytes, cfg.MultipartMaxPartBytes, cfg.CompleteXMLMaxBytes),
 		api.WithReadinessTimeout(cfg.ReadinessTimeout),
 		api.WithPprof(cfg.DebugPprofEnabled),
-	)
+	}
+	if cfg.AuthAllowAnonymous {
+		apiOptions = append(apiOptions, api.WithAnonymousTenant("default"))
+	}
+	handler := api.NewServer(objects, multipartManager, apiOptions...)
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           handler,
@@ -195,6 +197,13 @@ func newMetadataStore(ctx context.Context, cfg config.Config) (metadata.Store, e
 func newBlockStore(cfg config.Config) (backend.BlockStore, error) {
 	switch cfg.BackendProvider {
 	case "filesystem":
+		if cfg.LocalBlockEncryptionKey != "" {
+			key, err := config.DecodeLocalBlockEncryptionKey(cfg.LocalBlockEncryptionKey)
+			if err != nil {
+				return nil, err
+			}
+			return backend.NewEncryptedFileStore(cfg.BackendDir, key)
+		}
 		return backend.NewFileStore(cfg.BackendDir), nil
 	case "s3":
 		return backend.NewS3Store(backend.S3Options{

@@ -33,6 +33,7 @@ type Server struct {
 	maxCompleteXML    int64
 	readinessTimeout  time.Duration
 	debugPprofEnabled bool
+	anonymousTenant   string
 }
 
 type Option func(*Server)
@@ -90,6 +91,12 @@ func WithReadinessTimeout(timeout time.Duration) Option {
 func WithPprof(enabled bool) Option {
 	return func(server *Server) {
 		server.debugPprofEnabled = enabled
+	}
+}
+
+func WithAnonymousTenant(tenant string) Option {
+	return func(server *Server) {
+		server.anonymousTenant = tenant
 	}
 }
 
@@ -175,8 +182,16 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serviceRoute(w, r)
 		return
 	}
+	if !validateBucketName(target.Bucket) {
+		writeError(w, http.StatusBadRequest, "InvalidBucketName", "the specified bucket is not valid")
+		return
+	}
 	if !target.HasKey {
 		s.bucketRoute(w, r, target.Bucket)
+		return
+	}
+	if !validateObjectKey(target.Key) {
+		writeError(w, http.StatusBadRequest, "InvalidObjectName", "the specified object key is not valid")
 		return
 	}
 

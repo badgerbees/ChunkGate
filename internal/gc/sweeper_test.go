@@ -13,13 +13,15 @@ import (
 	"github.com/chunkgate/chunkgate/internal/metadata"
 )
 
+const testBlockHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 func TestSweeperDeletesUnreferencedBlocks(t *testing.T) {
 	ctx := context.Background()
 	store := metadata.NewMemoryStore()
 	blocks := backend.NewFileStore(t.TempDir())
 
-	createUnreferencedBlocks(t, ctx, store, "tenant-a", []string{"hash1234"})
-	if err := blocks.PutBlock(ctx, "tenant-a", "hash1234", []byte("payload")); err != nil {
+	createUnreferencedBlocks(t, ctx, store, "tenant-a", []string{testBlockHash})
+	if err := blocks.PutBlock(ctx, "tenant-a", testBlockHash, []byte("payload")); err != nil {
 		t.Fatalf("put block failed: %v", err)
 	}
 
@@ -40,8 +42,8 @@ func TestSweeperHonorsMinimumOrphanAge(t *testing.T) {
 	store := metadata.NewMemoryStore()
 	blocks := backend.NewFileStore(t.TempDir())
 
-	createUnreferencedBlocks(t, ctx, store, "tenant-a", []string{"hash1234"})
-	if err := blocks.PutBlock(ctx, "tenant-a", "hash1234", []byte("payload")); err != nil {
+	createUnreferencedBlocks(t, ctx, store, "tenant-a", []string{testBlockHash})
+	if err := blocks.PutBlock(ctx, "tenant-a", testBlockHash, []byte("payload")); err != nil {
 		t.Fatalf("put block failed: %v", err)
 	}
 
@@ -56,7 +58,7 @@ func TestSweeperHonorsMinimumOrphanAge(t *testing.T) {
 	if result.CandidateBlocks != 0 || result.DeletedBlocks != 0 {
 		t.Fatalf("result = %#v, want no candidates or deletes", result)
 	}
-	reader, err := blocks.GetBlock(ctx, "tenant-a", "hash1234")
+	reader, err := blocks.GetBlock(ctx, "tenant-a", testBlockHash)
 	if err != nil {
 		t.Fatalf("block should still exist: %v", err)
 	}
@@ -68,7 +70,7 @@ func TestSweeperDoesNotDeleteReferencedBlocks(t *testing.T) {
 	store := metadata.NewMemoryStore()
 	blocks := &recordingBackend{}
 
-	commitObject(t, ctx, store, "tenant-a", "bucket", "key", []string{"hash1234"})
+	commitObject(t, ctx, store, "tenant-a", "bucket", "key", []string{testBlockHash})
 	result, err := (Sweeper{Store: store, Backend: blocks}).Sweep(ctx)
 	if err != nil {
 		t.Fatalf("sweep failed: %v", err)
@@ -114,7 +116,7 @@ func TestSweeperBatchesRetriesAndRecordsMetrics(t *testing.T) {
 func TestSweeperForgetsMetadataOnlyAfterBackendDeleteSucceeds(t *testing.T) {
 	ctx := context.Background()
 	store := metadata.NewMemoryStore()
-	createUnreferencedBlocks(t, ctx, store, "tenant-a", []string{"hash1234"})
+	createUnreferencedBlocks(t, ctx, store, "tenant-a", []string{testBlockHash})
 
 	_, err := (Sweeper{
 		Store:      store,
@@ -128,8 +130,8 @@ func TestSweeperForgetsMetadataOnlyAfterBackendDeleteSucceeds(t *testing.T) {
 	if listErr != nil {
 		t.Fatalf("list unreferenced failed: %v", listErr)
 	}
-	if len(refs) != 1 || refs[0].Hash != "hash1234" {
-		t.Fatalf("refs = %#v, want hash1234 still present", refs)
+	if len(refs) != 1 || refs[0].Hash != testBlockHash {
+		t.Fatalf("refs = %#v, want test block still present", refs)
 	}
 }
 
@@ -138,7 +140,7 @@ func TestWorkerRunsSweeperInBackground(t *testing.T) {
 	defer cancel()
 
 	store := metadata.NewMemoryStore()
-	createUnreferencedBlocks(t, ctx, store, "tenant-a", []string{"hash1234"})
+	createUnreferencedBlocks(t, ctx, store, "tenant-a", []string{testBlockHash})
 	metrics := NewMetrics()
 	go (Worker{
 		Sweeper: &Sweeper{
@@ -239,7 +241,7 @@ func commitObject(t *testing.T, ctx context.Context, store metadata.Store, tenan
 func numberedHashes(count int) []string {
 	hashes := make([]string, 0, count)
 	for i := 0; i < count; i++ {
-		hashes = append(hashes, fmt.Sprintf("hash%08d", i))
+		hashes = append(hashes, fmt.Sprintf("%064x", i))
 	}
 	return hashes
 }

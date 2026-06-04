@@ -4,7 +4,6 @@ import (
 	"encoding/xml"
 	"errors"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/chunkgate/chunkgate/internal/multipart"
@@ -54,9 +53,13 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, tenant strin
 	}()
 
 	uploadID := r.URL.Query().Get("uploadId")
-	number, err := strconv.Atoi(r.URL.Query().Get("partNumber"))
-	if err != nil || number <= 0 {
-		writeError(w, http.StatusBadRequest, "InvalidPart", "partNumber must be a positive integer")
+	if !validateUploadID(uploadID) {
+		writeError(w, http.StatusNotFound, "NoSuchUpload", "the specified multipart upload does not exist")
+		return
+	}
+	number, ok := parsePartNumber(r.URL.Query().Get("partNumber"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "InvalidPart", "partNumber must be an integer between 1 and 10000")
 		return
 	}
 	if s.maxPartBytes > 0 && r.ContentLength > s.maxPartBytes {
@@ -122,6 +125,10 @@ func (s *Server) completeMultipart(w http.ResponseWriter, r *http.Request, tenan
 	}()
 
 	uploadID := r.URL.Query().Get("uploadId")
+	if !validateUploadID(uploadID) {
+		writeError(w, http.StatusNotFound, "NoSuchUpload", "the specified multipart upload does not exist")
+		return
+	}
 	var request completeMultipartUpload
 	body, ok := s.limitedBody(w, r, s.maxCompleteXML)
 	if !ok {
@@ -191,7 +198,12 @@ func (s *Server) completeMultipart(w http.ResponseWriter, r *http.Request, tenan
 }
 
 func (s *Server) abortMultipart(w http.ResponseWriter, r *http.Request, tenant string) {
-	if err := s.multipart.Abort(r.Context(), tenant, r.URL.Query().Get("uploadId")); errors.Is(err, multipart.ErrUploadNotFound) {
+	uploadID := r.URL.Query().Get("uploadId")
+	if !validateUploadID(uploadID) {
+		writeError(w, http.StatusNotFound, "NoSuchUpload", "the specified multipart upload does not exist")
+		return
+	}
+	if err := s.multipart.Abort(r.Context(), tenant, uploadID); errors.Is(err, multipart.ErrUploadNotFound) {
 		writeError(w, http.StatusNotFound, "NoSuchUpload", "the specified multipart upload does not exist")
 		return
 	} else if err != nil {
@@ -209,8 +221,8 @@ func validateCompletedParts(uploaded map[int]multipart.PartInfo, completed []com
 	seen := map[int]bool{}
 	last := 0
 	for _, part := range completed {
-		if part.PartNumber <= 0 {
-			return nil, s3Error{Status: http.StatusBadRequest, Code: "InvalidPart", Message: "part numbers must be positive"}
+		if part.PartNumber <= 0 || part.PartNumber > maxS3PartNumber {
+			return nil, s3Error{Status: http.StatusBadRequest, Code: "InvalidPart", Message: "part numbers must be between 1 and 10000"}
 		}
 		if part.PartNumber <= last {
 			return nil, s3Error{Status: http.StatusBadRequest, Code: "InvalidPartOrder", Message: "the list of parts was not in ascending order"}

@@ -209,7 +209,7 @@ func (s *S3Store) HealthCheck(ctx context.Context) error {
 }
 
 func (s *S3Store) blockKey(tenant string, hash string) (string, error) {
-	if len(hash) < 2 || strings.Contains(hash, "/") || strings.Contains(hash, "\\") || strings.Contains(hash, "..") {
+	if !validBlockHash(hash) {
 		return "", fmt.Errorf("invalid block hash %q", hash)
 	}
 	return s.prefix + "tenants/" + sanitizePathPart(tenant) + "/blocks/" + hash[:2] + "/" + hash, nil

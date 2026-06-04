@@ -15,6 +15,7 @@ This repository currently contains the deployable base architecture:
 - Migration-managed structured metadata tables for objects, chunks, blocks, and multipart state.
 - Optional PostgreSQL metadata backend for horizontally scaled ChunkGate replicas.
 - Tenant-scoped filesystem block storage under `data/backend`.
+- Optional AES-GCM encryption for local filesystem blocks.
 - Durable sequential multipart spooling under `data/scratch`, with restart reload and stale upload cleanup.
 - Atomic local capacity reservations for multipart upload initiation.
 - Adaptive CPU concurrency gating around chunk processing with configurable headroom.
@@ -28,7 +29,7 @@ This repository currently contains the deployable base architecture:
 ## Run Locally
 
 ```sh
-go run ./cmd/chunkgate
+CHUNKGATE_ALLOW_ANONYMOUS=true go run ./cmd/chunkgate
 ```
 
 ```sh
@@ -38,7 +39,7 @@ curl -I http://localhost:8080/builds/artifact.tar
 curl -X DELETE http://localhost:8080/builds/artifact.tar
 ```
 
-By default, local development runs without authentication and uses the `default` tenant. For S3-client compatible authentication, configure access keys and point your SDK or CLI at the ChunkGate endpoint.
+Anonymous mode is only enabled when `CHUNKGATE_ALLOW_ANONYMOUS=true`; it uses the `default` tenant and is intended for local curl testing. By default, ChunkGate requires AWS SigV4 credentials and derives tenant identity from the authenticated access key or configured tenant mapping.
 
 ## Docker Compose
 
@@ -67,6 +68,7 @@ The Compose PostgreSQL service is exposed on host port `15432` to avoid collidin
 | `CHUNKGATE_BACKEND_DIR` | `${CHUNKGATE_DATA_DIR}/backend` |
 | `CHUNKGATE_SCRATCH_DIR` | `${CHUNKGATE_DATA_DIR}/scratch` |
 | `CHUNKGATE_BACKEND` | `filesystem`, or `s3` |
+| `CHUNKGATE_LOCAL_BLOCK_ENCRYPTION_KEY` | unset, AES key for filesystem backend only |
 | `CHUNKGATE_LOCAL_CAPACITY_BYTES` | `21474836480` |
 | `CHUNKGATE_MAX_CONCURRENT_CHUNKERS` | `0` meaning CPU count |
 | `CHUNKGATE_CPU_HEADROOM_CORES` | `1` |
@@ -104,16 +106,19 @@ The Compose PostgreSQL service is exposed on host port `15432` to avoid collidin
 | `CHUNKGATE_READINESS_TIMEOUT_SECONDS` | `3` |
 | `CHUNKGATE_SHUTDOWN_TIMEOUT_SECONDS` | `15` |
 | `CHUNKGATE_DEBUG_PPROF_ENABLED` | `false` |
+| `CHUNKGATE_ALLOW_ANONYMOUS` | `false` |
 | `CHUNKGATE_ACCESS_KEY_ID` | unset |
 | `CHUNKGATE_SECRET_ACCESS_KEY` | unset |
 | `CHUNKGATE_TENANT_ID` | access key value |
 | `CHUNKGATE_CREDENTIALS` | unset, comma-separated `access:secret[:tenant]` entries |
 
-If `CHUNKGATE_ACCESS_KEY_ID`/`CHUNKGATE_SECRET_ACCESS_KEY` or `CHUNKGATE_CREDENTIALS` are set, ChunkGate requires AWS SigV4 authorization. Tenant isolation is then derived from the authenticated access key or optional tenant value.
+Unless `CHUNKGATE_ALLOW_ANONYMOUS=true` is set, `CHUNKGATE_ACCESS_KEY_ID`/`CHUNKGATE_SECRET_ACCESS_KEY` or `CHUNKGATE_CREDENTIALS` are required and every S3 request must be AWS SigV4 signed. Tenant isolation is derived from the authenticated access key or optional tenant value.
 
 Example with the AWS CLI:
 
 ```sh
+CHUNKGATE_ACCESS_KEY_ID=tenant-a CHUNKGATE_SECRET_ACCESS_KEY=dev-secret go run ./cmd/chunkgate
+
 AWS_ACCESS_KEY_ID=tenant-a AWS_SECRET_ACCESS_KEY=dev-secret \
   aws --endpoint-url http://localhost:8080 s3 cp artifact.tar s3://builds/artifact.tar
 ```
@@ -127,6 +132,8 @@ CHUNKGATE_S3_REGION=us-east-1 \
 CHUNKGATE_S3_BUCKET=my-chunkgate-blocks \
 CHUNKGATE_S3_ACCESS_KEY_ID=... \
 CHUNKGATE_S3_SECRET_ACCESS_KEY=... \
+CHUNKGATE_ACCESS_KEY_ID=tenant-a \
+CHUNKGATE_SECRET_ACCESS_KEY=dev-secret \
 go run ./cmd/chunkgate
 ```
 
@@ -135,6 +142,8 @@ Example with shared PostgreSQL metadata:
 ```sh
 CHUNKGATE_METADATA=postgres \
 CHUNKGATE_POSTGRES_DSN='postgres://chunkgate:chunkgate@localhost:5432/chunkgate?sslmode=disable' \
+CHUNKGATE_ACCESS_KEY_ID=tenant-a \
+CHUNKGATE_SECRET_ACCESS_KEY=dev-secret \
 go run ./cmd/chunkgate
 ```
 
@@ -170,3 +179,5 @@ Operational endpoints:
 ## Storage Layers
 
 The core object service depends on `backend.BlockStore`, so filesystem and S3-compatible block storage share the same code path. The metadata layer depends on `metadata.Store`, so SQLite and PostgreSQL can be selected without changing the API, object, chunking, multipart, or GC layers.
+
+Security assumptions and remaining risks are documented in [docs/threat-model.md](docs/threat-model.md).

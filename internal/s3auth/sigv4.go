@@ -37,16 +37,15 @@ func (e *Error) Error() string {
 }
 
 type Verifier struct {
-	credentials map[string]Credential
+	credentials []Credential
 	Now         func() time.Time
 	MaxSkew     time.Duration
 }
 
 func NewVerifier(credentials []Credential) (*Verifier, error) {
 	verifier := &Verifier{
-		credentials: map[string]Credential{},
-		Now:         time.Now,
-		MaxSkew:     15 * time.Minute,
+		Now:     time.Now,
+		MaxSkew: 15 * time.Minute,
 	}
 	for _, credential := range credentials {
 		if credential.AccessKey == "" || credential.SecretKey == "" {
@@ -55,7 +54,7 @@ func NewVerifier(credentials []Credential) (*Verifier, error) {
 		if credential.Tenant == "" {
 			credential.Tenant = credential.AccessKey
 		}
-		verifier.credentials[credential.AccessKey] = credential
+		verifier.credentials = append(verifier.credentials, credential)
 	}
 	return verifier, nil
 }
@@ -78,7 +77,7 @@ func (v *Verifier) Verify(r *http.Request) (Identity, error) {
 	if err != nil {
 		return Identity{}, err
 	}
-	credential, ok := v.credentials[parsed.accessKey]
+	credential, ok := v.lookupCredential(parsed.accessKey)
 	if !ok {
 		return Identity{}, authError(http.StatusForbidden, "InvalidAccessKeyId", "the AWS access key ID does not exist")
 	}
@@ -119,6 +118,19 @@ func (v *Verifier) Verify(r *http.Request) (Identity, error) {
 	}
 
 	return Identity{AccessKey: credential.AccessKey, Tenant: credential.Tenant}, nil
+}
+
+func (v *Verifier) lookupCredential(accessKey string) (Credential, bool) {
+	var selected Credential
+	found := 0
+	for _, credential := range v.credentials {
+		equal := constantTimeStringEqual(credential.AccessKey, accessKey)
+		if equal == 1 && found == 0 {
+			selected = credential
+		}
+		found |= equal
+	}
+	return selected, found == 1
 }
 
 type parsedAuthorization struct {
@@ -263,6 +275,12 @@ func constantTimeHexEqual(expected string, actual string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare(expectedBytes, actualBytes) == 1
+}
+
+func constantTimeStringEqual(expected string, actual string) int {
+	expectedHash := sha256.Sum256([]byte(expected))
+	actualHash := sha256.Sum256([]byte(actual))
+	return subtle.ConstantTimeCompare(expectedHash[:], actualHash[:])
 }
 
 func collapseSpaces(value string) string {

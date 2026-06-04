@@ -111,6 +111,30 @@ func TestServicePutStreamsAndSkipsDuplicateChunkWrites(t *testing.T) {
 	}
 }
 
+func TestServiceDeduplicatesOnlyWithinTenantBoundary(t *testing.T) {
+	ctx := context.Background()
+	blocks := newDedupeBlockStore()
+	service := NewService(Config{
+		Chunker: chunker.New(chunker.Options{MinSize: 4, AvgSize: 4, MaxSize: 4, SmallFileThreshold: 0, Engine: chunker.EngineBuiltin}),
+		Backend: blocks,
+		Store:   metadata.NewMemoryStore(),
+		CPU:     limits.NewCPUSemaphore(1),
+	})
+
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		if _, err := service.Put(ctx, tenant, "bucket", "key", strings.NewReader("abcdabcdabcdabcd")); err != nil {
+			t.Fatalf("put for %s failed: %v", tenant, err)
+		}
+	}
+
+	if blocks.puts != 2 {
+		t.Fatalf("put block calls = %d, want one physical write per tenant", blocks.puts)
+	}
+	if len(blocks.blocks) != 2 {
+		t.Fatalf("stored blocks = %d, want tenant-isolated block copies", len(blocks.blocks))
+	}
+}
+
 func TestServicePutStopsWhenUploadContextIsCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	blocks := newDedupeBlockStore()
