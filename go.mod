@@ -1,6 +1,6 @@
 module github.com/chunkgate/chunkgate
 
-go 1.25.9
+go 1.25.11
 
 require (
 	github.com/jackc/pgx/v5 v5.10.0
