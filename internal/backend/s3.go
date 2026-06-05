@@ -35,15 +35,23 @@ type S3Options struct {
 }
 
 type S3Store struct {
-	client     *minio.Client
+	client     s3ObjectClient
 	bucket     string
 	prefix     string
 	timeout    time.Duration
 	maxRetries int
 }
 
+type s3ObjectClient interface {
+	PutObject(ctx context.Context, bucket string, key string, data []byte) error
+	GetObject(ctx context.Context, bucket string, key string) (io.ReadCloser, error)
+	StatObject(ctx context.Context, bucket string, key string) error
+	DeleteObjects(ctx context.Context, bucket string, keys []string) error
+	BucketExists(ctx context.Context, bucket string) (bool, error)
+}
+
 func NewS3Store(options S3Options) (*S3Store, error) {
-	endpoint, secure, err := normalizeEndpoint(options.Endpoint, options.Secure)
+	endpoint, err := normalizeEndpoint(options.Endpoint, options.Secure)
 	if err != nil {
 		return nil, err
 	}
@@ -65,15 +73,28 @@ func NewS3Store(options S3Options) (*S3Store, error) {
 	if options.PathStyle {
 		bucketLookup = minio.BucketLookupPath
 	}
-	client, err := minio.New(endpoint, &minio.Options{
-		Creds:        credentials.NewStaticV4(options.AccessKey, options.SecretKey, options.SessionToken),
-		Secure:       secure,
-		Region:       options.Region,
-		BucketLookup: bucketLookup,
-		MaxRetries:   1,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create s3 client: %w", err)
+	var client s3ObjectClient
+	if endpoint.BasePath != "" {
+		client = newPathS3Client(pathS3Options{
+			Endpoint:     endpoint,
+			Region:       options.Region,
+			AccessKey:    options.AccessKey,
+			SecretKey:    options.SecretKey,
+			SessionToken: options.SessionToken,
+			PathStyle:    options.PathStyle,
+		})
+	} else {
+		minioClient, err := minio.New(endpoint.Host, &minio.Options{
+			Creds:        credentials.NewStaticV4(options.AccessKey, options.SecretKey, options.SessionToken),
+			Secure:       endpoint.Secure,
+			Region:       options.Region,
+			BucketLookup: bucketLookup,
+			MaxRetries:   1,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create s3 client: %w", err)
+		}
+		client = minioS3Client{client: minioClient}
 	}
 
 	return &S3Store{
@@ -91,10 +112,7 @@ func (s *S3Store) PutBlock(ctx context.Context, tenant string, hash string, data
 		return err
 	}
 	err = s.withRetry(ctx, func(ctx context.Context) error {
-		_, err := s.client.PutObject(ctx, s.bucket, key, bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{
-			ContentType: "application/octet-stream",
-		})
-		return err
+		return s.client.PutObject(ctx, s.bucket, key, data)
 	})
 	return wrapS3Error("put block", key, err)
 }
@@ -118,7 +136,7 @@ func (s *S3Store) GetBlock(ctx context.Context, tenant string, hash string) (io.
 		if s.timeout > 0 {
 			attemptCtx, cancel = context.WithTimeout(ctx, s.timeout)
 		}
-		object, err := s.client.GetObject(attemptCtx, s.bucket, key, minio.GetObjectOptions{})
+		object, err := s.client.GetObject(attemptCtx, s.bucket, key)
 		if err == nil {
 			return s3ReadCloser{ReadCloser: object, key: key, cancel: cancel}, nil
 		}
@@ -147,8 +165,7 @@ func (s *S3Store) HasBlock(ctx context.Context, tenant string, hash string) (boo
 		return false, err
 	}
 	err = s.withRetry(ctx, func(ctx context.Context) error {
-		_, err := s.client.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{})
-		return err
+		return s.client.StatObject(ctx, s.bucket, key)
 	})
 	if err == nil {
 		return true, nil
@@ -173,23 +190,7 @@ func (s *S3Store) DeleteBlocks(ctx context.Context, tenant string, hashes []stri
 	}
 
 	err := s.withRetry(ctx, func(ctx context.Context) error {
-		objects := make(chan minio.ObjectInfo)
-		go func() {
-			defer close(objects)
-			for _, key := range keys {
-				select {
-				case objects <- minio.ObjectInfo{Key: key}:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
-		for deleteErr := range s.client.RemoveObjects(ctx, s.bucket, objects, minio.RemoveObjectsOptions{}) {
-			if deleteErr.Err != nil && !isS3NotFound(deleteErr.Err) {
-				return deleteErr.Err
-			}
-		}
-		return ctx.Err()
+		return s.client.DeleteObjects(ctx, s.bucket, keys)
 	})
 	return wrapS3Error("delete blocks", tenant, err)
 }
@@ -249,6 +250,50 @@ func (s *S3Store) withRetry(ctx context.Context, operation func(context.Context)
 	return last
 }
 
+type minioS3Client struct {
+	client *minio.Client
+}
+
+func (c minioS3Client) PutObject(ctx context.Context, bucket string, key string, data []byte) error {
+	_, err := c.client.PutObject(ctx, bucket, key, bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{
+		ContentType: "application/octet-stream",
+	})
+	return err
+}
+
+func (c minioS3Client) GetObject(ctx context.Context, bucket string, key string) (io.ReadCloser, error) {
+	return c.client.GetObject(ctx, bucket, key, minio.GetObjectOptions{})
+}
+
+func (c minioS3Client) StatObject(ctx context.Context, bucket string, key string) error {
+	_, err := c.client.StatObject(ctx, bucket, key, minio.StatObjectOptions{})
+	return err
+}
+
+func (c minioS3Client) DeleteObjects(ctx context.Context, bucket string, keys []string) error {
+	objects := make(chan minio.ObjectInfo)
+	go func() {
+		defer close(objects)
+		for _, key := range keys {
+			select {
+			case objects <- minio.ObjectInfo{Key: key}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	for deleteErr := range c.client.RemoveObjects(ctx, bucket, objects, minio.RemoveObjectsOptions{}) {
+		if deleteErr.Err != nil && !isS3NotFound(deleteErr.Err) {
+			return deleteErr.Err
+		}
+	}
+	return ctx.Err()
+}
+
+func (c minioS3Client) BucketExists(ctx context.Context, bucket string) (bool, error) {
+	return c.client.BucketExists(ctx, bucket)
+}
+
 type s3ReadCloser struct {
 	io.ReadCloser
 	key    string
@@ -274,34 +319,48 @@ func (r s3ReadCloser) Close() error {
 	return nil
 }
 
-func normalizeEndpoint(endpoint string, secure bool) (string, bool, error) {
+type normalizedS3Endpoint struct {
+	Host     string
+	BasePath string
+	Secure   bool
+}
+
+func normalizeEndpoint(endpoint string, secure bool) (normalizedS3Endpoint, error) {
 	endpoint = strings.TrimSpace(endpoint)
 	if endpoint == "" {
-		return "", secure, fmt.Errorf("s3 endpoint must not be empty")
+		return normalizedS3Endpoint{}, fmt.Errorf("s3 endpoint must not be empty")
 	}
+	normalized := normalizedS3Endpoint{Secure: secure}
 	if strings.Contains(endpoint, "://") {
 		parsed, err := url.Parse(endpoint)
 		if err != nil {
-			return "", secure, fmt.Errorf("parse s3 endpoint: %w", err)
+			return normalizedS3Endpoint{}, fmt.Errorf("parse s3 endpoint: %w", err)
 		}
 		switch parsed.Scheme {
 		case "http":
-			secure = false
+			normalized.Secure = false
 		case "https":
-			secure = true
+			normalized.Secure = true
 		default:
-			return "", secure, fmt.Errorf("s3 endpoint scheme must be http or https")
+			return normalizedS3Endpoint{}, fmt.Errorf("s3 endpoint scheme must be http or https")
 		}
-		if parsed.Path != "" && parsed.Path != "/" {
-			return "", secure, fmt.Errorf("s3 endpoint must not include a path")
-		}
+		normalized.BasePath = cleanEndpointBasePath(parsed.Path)
 		endpoint = parsed.Host
 	}
 	endpoint = strings.TrimSuffix(endpoint, "/")
 	if endpoint == "" {
-		return "", secure, fmt.Errorf("s3 endpoint must not be empty")
+		return normalizedS3Endpoint{}, fmt.Errorf("s3 endpoint must not be empty")
 	}
-	return endpoint, secure, nil
+	normalized.Host = endpoint
+	return normalized, nil
+}
+
+func cleanEndpointBasePath(basePath string) string {
+	basePath = strings.TrimSpace(basePath)
+	if basePath == "" || basePath == "/" {
+		return ""
+	}
+	return "/" + strings.Trim(basePath, "/")
 }
 
 func cleanS3Prefix(prefix string) string {
@@ -322,18 +381,40 @@ func wrapS3Error(operation string, key string, err error) error {
 	if isS3NotFound(err) {
 		return fmt.Errorf("%w: %s %s", ErrBlockNotFound, operation, key)
 	}
-	if errors.Is(err, context.DeadlineExceeded) || isS3Unavailable(err) || minio.ToErrorResponse(err).Code == "NoSuchBucket" {
+	if errors.Is(err, context.DeadlineExceeded) || isS3Unavailable(err) || isS3NoSuchBucket(err) {
 		return fmt.Errorf("%w: %s %s: %w", ErrBackendUnavailable, operation, key, err)
 	}
 	return fmt.Errorf("%s %s: %w", operation, key, err)
 }
 
 func isS3NotFound(err error) bool {
+	var httpErr s3HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.Code == "NoSuchKey" || httpErr.Code == "NoSuchObject" || httpErr.StatusCode == http.StatusNotFound && httpErr.Code != "NoSuchBucket"
+	}
 	response := minio.ToErrorResponse(err)
 	return response.Code == "NoSuchKey" || response.Code == "NoSuchObject" || response.StatusCode == http.StatusNotFound && response.Code != "NoSuchBucket"
 }
 
+func isS3NoSuchBucket(err error) bool {
+	var httpErr s3HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.Code == "NoSuchBucket"
+	}
+	return minio.ToErrorResponse(err).Code == "NoSuchBucket"
+}
+
 func isS3Unavailable(err error) bool {
+	var httpErr s3HTTPError
+	if errors.As(err, &httpErr) {
+		if httpErr.StatusCode >= 500 || httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode == http.StatusRequestTimeout {
+			return true
+		}
+		switch httpErr.Code {
+		case "InternalError", "RequestTimeout", "ServiceUnavailable", "SlowDown", "Throttling", "ThrottlingException":
+			return true
+		}
+	}
 	response := minio.ToErrorResponse(err)
 	if response.StatusCode >= 500 || response.StatusCode == http.StatusTooManyRequests || response.StatusCode == http.StatusRequestTimeout {
 		return true

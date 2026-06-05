@@ -39,7 +39,16 @@ CHUNKGATE_S3_ACCESS_KEY_ID=...
 CHUNKGATE_S3_SECRET_ACCESS_KEY=...
 ```
 
-The same adapter works with AWS S3, MinIO, Cloudflare R2, and other S3-compatible endpoints. If the endpoint includes `http://` or `https://`, ChunkGate infers TLS from that scheme. Otherwise, `CHUNKGATE_S3_USE_TLS` controls whether HTTPS is used.
+The same adapter works with AWS S3, MinIO, Cloudflare R2, Supabase Storage S3, and other S3-compatible endpoints. If the endpoint includes `http://` or `https://`, ChunkGate infers TLS from that scheme. Otherwise, `CHUNKGATE_S3_USE_TLS` controls whether HTTPS is used.
+
+Endpoints may include a provider base path. For example, Supabase Storage uses:
+
+```sh
+CHUNKGATE_S3_ENDPOINT=https://project_ref.storage.supabase.co/storage/v1/s3
+CHUNKGATE_S3_PATH_STYLE=true
+```
+
+When a base path is present, ChunkGate signs requests against the full provider path before sending them, so no external reverse proxy is needed.
 
 Blocks are stored under tenant-isolated object keys:
 
