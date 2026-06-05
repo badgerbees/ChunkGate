@@ -150,6 +150,19 @@ func (s *S3Store) GetBlock(ctx context.Context, tenant string, hash string) (io.
 		if s.timeout > 0 {
 			attemptCtx, cancel = context.WithTimeout(ctx, s.timeout)
 		}
+		if err := s.client.StatObject(attemptCtx, s.bucket, key); err != nil {
+			if cancel != nil {
+				cancel()
+			}
+			last = err
+			if !retryableS3Error(ctx, err) || attempt == attempts-1 {
+				break
+			}
+			if err := waitRetryDelay(ctx, defaultRetryBaseDelay, attempt); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		object, err := s.client.GetObject(attemptCtx, s.bucket, key)
 		if err == nil {
 			return s3ReadCloser{ReadCloser: object, key: key, cancel: cancel}, nil
