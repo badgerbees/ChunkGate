@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestValidateAcceptsPostgresMetadata(t *testing.T) {
 	cfg := validTestConfig()
@@ -78,6 +81,48 @@ func TestValidateRejectsInvalidOperationalGuardrails(t *testing.T) {
 				t.Fatal("expected validation to fail")
 			}
 		})
+	}
+}
+
+func TestFromEnvParsesVirtualHostsAndCORS(t *testing.T) {
+	t.Setenv("CHUNKGATE_ALLOW_ANONYMOUS", "true")
+	t.Setenv("CHUNKGATE_VIRTUAL_HOSTS", "s3.example.com, localhost")
+	t.Setenv("CHUNKGATE_CORS_ALLOWED_ORIGINS", "https://app.example.com,https://admin.example.com")
+	t.Setenv("CHUNKGATE_CORS_ALLOWED_METHODS", "GET PUT")
+	t.Setenv("CHUNKGATE_CORS_ALLOWED_HEADERS", "authorization,x-amz-date")
+	t.Setenv("CHUNKGATE_CORS_EXPOSED_HEADERS", "ETag,x-amz-request-id")
+	t.Setenv("CHUNKGATE_CORS_ALLOW_CREDENTIALS", "true")
+	t.Setenv("CHUNKGATE_CORS_MAX_AGE_SECONDS", "900")
+
+	cfg := FromEnv()
+	for name, gotWant := range map[string]struct {
+		got  []string
+		want []string
+	}{
+		"virtual hosts":   {cfg.VirtualHosts, []string{"s3.example.com", "localhost"}},
+		"cors origins":    {cfg.CORSAllowedOrigins, []string{"https://app.example.com", "https://admin.example.com"}},
+		"cors methods":    {cfg.CORSAllowedMethods, []string{"GET", "PUT"}},
+		"cors headers":    {cfg.CORSAllowedHeaders, []string{"authorization", "x-amz-date"}},
+		"exposed headers": {cfg.CORSExposedHeaders, []string{"ETag", "x-amz-request-id"}},
+	} {
+		if !reflect.DeepEqual(gotWant.got, gotWant.want) {
+			t.Fatalf("%s = %#v, want %#v", name, gotWant.got, gotWant.want)
+		}
+	}
+	if !cfg.CORSAllowCredentials {
+		t.Fatal("expected CORS credentials to be enabled")
+	}
+	if cfg.CORSMaxAgeSeconds != 900 {
+		t.Fatalf("cors max age = %d", cfg.CORSMaxAgeSeconds)
+	}
+}
+
+func TestValidateRejectsWildcardCORSWithCredentials(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.CORSAllowedOrigins = []string{"*"}
+	cfg.CORSAllowCredentials = true
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected wildcard CORS origin with credentials to fail validation")
 	}
 }
 

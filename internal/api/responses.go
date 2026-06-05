@@ -10,8 +10,11 @@ import (
 	"github.com/chunkgate/chunkgate/internal/limits"
 )
 
-func addCommonHeaders(w http.ResponseWriter) {
-	w.Header().Set("x-amz-request-id", "chunkgate")
+func addCommonHeaders(w http.ResponseWriter, requestID string) {
+	if requestID == "" {
+		requestID = "chunkgate"
+	}
+	w.Header().Set("x-amz-request-id", requestID)
 }
 
 func writeXML(w http.ResponseWriter, status int, value any) {
@@ -28,7 +31,11 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func writeError(w http.ResponseWriter, status int, code string, message string) {
-	writeXML(w, status, errorResponse{Code: code, Message: message, RequestID: "chunkgate"})
+	requestID := w.Header().Get("x-amz-request-id")
+	if requestID == "" {
+		requestID = "chunkgate"
+	}
+	writeXML(w, status, errorResponse{Code: code, Message: message, RequestID: requestID})
 }
 
 func writeInternalError(w http.ResponseWriter, err error) {

@@ -247,6 +247,100 @@ func TestServerHandlesBucketLevelRoutes(t *testing.T) {
 	}
 }
 
+func TestServerHandlesVirtualHostedStyleBucketRequests(t *testing.T) {
+	server := testServer(t, withVirtualHosts("chunkgate.test"))
+
+	put := httptest.NewRequest(http.MethodPut, "http://photos.chunkgate.test/cat.jpg", strings.NewReader("image-data"))
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, put)
+	if w.Code != http.StatusOK {
+		t.Fatalf("virtual-host put status = %d body = %s", w.Code, w.Body.String())
+	}
+
+	get := httptest.NewRequest(http.MethodGet, "http://photos.chunkgate.test/cat.jpg", nil)
+	w = httptest.NewRecorder()
+	server.ServeHTTP(w, get)
+	if w.Code != http.StatusOK {
+		t.Fatalf("virtual-host get status = %d body = %s", w.Code, w.Body.String())
+	}
+	if got := w.Body.String(); got != "image-data" {
+		t.Fatalf("virtual-host body = %q", got)
+	}
+
+	bucket := httptest.NewRequest(http.MethodHead, "http://photos.chunkgate.test/", nil)
+	w = httptest.NewRecorder()
+	server.ServeHTTP(w, bucket)
+	if w.Code != http.StatusOK {
+		t.Fatalf("virtual-host bucket status = %d body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestServerHandlesStaticCORSPreflightAndActualRequest(t *testing.T) {
+	server := testServer(t, withCORS(CORSConfig{
+		AllowedOrigins:   []string{"https://app.example.com"},
+		AllowedMethods:   []string{http.MethodGet, http.MethodPut},
+		AllowedHeaders:   []string{"authorization", "x-amz-date"},
+		ExposedHeaders:   []string{"ETag", "x-amz-request-id"},
+		AllowCredentials: true,
+		MaxAgeSeconds:    600,
+	}))
+
+	preflight := httptest.NewRequest(http.MethodOptions, "/bucket/key.txt", nil)
+	preflight.Header.Set("Origin", "https://app.example.com")
+	preflight.Header.Set("Access-Control-Request-Method", http.MethodPut)
+	preflight.Header.Set("Access-Control-Request-Headers", "authorization, x-amz-date")
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, preflight)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d body = %s", w.Code, w.Body.String())
+	}
+	for key, want := range map[string]string{
+		"Access-Control-Allow-Origin":      "https://app.example.com",
+		"Access-Control-Allow-Credentials": "true",
+		"Access-Control-Allow-Methods":     "GET, PUT",
+		"Access-Control-Allow-Headers":     "authorization, x-amz-date",
+		"Access-Control-Max-Age":           "600",
+	} {
+		if got := w.Header().Get(key); got != want {
+			t.Fatalf("%s = %q, want %q", key, got, want)
+		}
+	}
+
+	put := httptest.NewRequest(http.MethodPut, "/bucket/key.txt", strings.NewReader("payload"))
+	put.Header.Set("Origin", "https://app.example.com")
+	w = httptest.NewRecorder()
+	server.ServeHTTP(w, put)
+	if w.Code != http.StatusOK {
+		t.Fatalf("cors put status = %d body = %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
+		t.Fatalf("actual allow origin = %q", got)
+	}
+	if got := w.Header().Get("Access-Control-Expose-Headers"); got != "ETag, x-amz-request-id" {
+		t.Fatalf("expose headers = %q", got)
+	}
+}
+
+func TestServerWritesUniqueRequestIDs(t *testing.T) {
+	server := testServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/missing.txt", nil)
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, req)
+	first := w.Header().Get("x-amz-request-id")
+	if first == "" || !strings.Contains(w.Body.String(), "<RequestId>"+first+"</RequestId>") {
+		t.Fatalf("first request id header/body mismatch: header=%q body=%s", first, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/bucket/missing.txt", nil)
+	w = httptest.NewRecorder()
+	server.ServeHTTP(w, req)
+	second := w.Header().Get("x-amz-request-id")
+	if second == "" || second == first {
+		t.Fatalf("request ids should be non-empty and unique: first=%q second=%q", first, second)
+	}
+}
+
 func TestServerCompletesMultipartInRequestedOrder(t *testing.T) {
 	server := testServer(t)
 
@@ -912,6 +1006,8 @@ type serverTestConfig struct {
 	maxXML     int64
 	pprof      bool
 	anonymous  *string
+	virtual    []string
+	cors       CORSConfig
 }
 
 func testServer(t *testing.T, options ...serverOption) *Server {
@@ -959,6 +1055,12 @@ func testServer(t *testing.T, options ...serverOption) *Server {
 	}
 	if cfg.pprof {
 		apiOptions = append(apiOptions, WithPprof(true))
+	}
+	if len(cfg.virtual) > 0 {
+		apiOptions = append(apiOptions, WithVirtualHosts(cfg.virtual...))
+	}
+	if len(cfg.cors.AllowedOrigins) > 0 {
+		apiOptions = append(apiOptions, WithCORS(cfg.cors))
 	}
 	return NewServer(service, multipart.NewManager(t.TempDir(), limits.NewDiskReservations(1024*1024)), apiOptions...)
 }
@@ -1020,6 +1122,18 @@ func withBodyLimits(maxObject int64, maxPart int64, maxXML int64) serverOption {
 func withPprof() serverOption {
 	return func(config *serverTestConfig) {
 		config.pprof = true
+	}
+}
+
+func withVirtualHosts(hosts ...string) serverOption {
+	return func(config *serverTestConfig) {
+		config.virtual = hosts
+	}
+}
+
+func withCORS(cors CORSConfig) serverOption {
+	return func(config *serverTestConfig) {
+		config.cors = cors
 	}
 }
 

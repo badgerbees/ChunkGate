@@ -47,6 +47,7 @@ const (
 	defaultPGLifetime   = 30 * time.Minute
 	defaultReadyTimeout = 3 * time.Second
 	defaultShutdown     = 15 * time.Second
+	defaultCORSMaxAge   = 3600
 )
 
 type Config struct {
@@ -95,6 +96,13 @@ type Config struct {
 	ReadinessTimeout        time.Duration
 	ShutdownTimeout         time.Duration
 	DebugPprofEnabled       bool
+	VirtualHosts            []string
+	CORSAllowedOrigins      []string
+	CORSAllowedMethods      []string
+	CORSAllowedHeaders      []string
+	CORSExposedHeaders      []string
+	CORSAllowCredentials    bool
+	CORSMaxAgeSeconds       int
 	AuthAllowAnonymous      bool
 	AuthCredentials         []s3auth.Credential
 }
@@ -147,6 +155,13 @@ func FromEnv() Config {
 		ReadinessTimeout:        envDurationSeconds("CHUNKGATE_READINESS_TIMEOUT_SECONDS", defaultReadyTimeout),
 		ShutdownTimeout:         envDurationSeconds("CHUNKGATE_SHUTDOWN_TIMEOUT_SECONDS", defaultShutdown),
 		DebugPprofEnabled:       envBool("CHUNKGATE_DEBUG_PPROF_ENABLED", false),
+		VirtualHosts:            envList("CHUNKGATE_VIRTUAL_HOSTS"),
+		CORSAllowedOrigins:      envList("CHUNKGATE_CORS_ALLOWED_ORIGINS"),
+		CORSAllowedMethods:      envList("CHUNKGATE_CORS_ALLOWED_METHODS"),
+		CORSAllowedHeaders:      envList("CHUNKGATE_CORS_ALLOWED_HEADERS"),
+		CORSExposedHeaders:      envList("CHUNKGATE_CORS_EXPOSED_HEADERS"),
+		CORSAllowCredentials:    envBool("CHUNKGATE_CORS_ALLOW_CREDENTIALS", false),
+		CORSMaxAgeSeconds:       envInt("CHUNKGATE_CORS_MAX_AGE_SECONDS", defaultCORSMaxAge),
 		AuthAllowAnonymous:      envBool("CHUNKGATE_ALLOW_ANONYMOUS", defaultAuthAnon),
 		AuthCredentials:         credentialsFromEnv(),
 	}
@@ -274,6 +289,16 @@ func (c Config) Validate() error {
 	if c.ShutdownTimeout < 0 {
 		return fmt.Errorf("CHUNKGATE_SHUTDOWN_TIMEOUT_SECONDS must be >= 0")
 	}
+	if c.CORSMaxAgeSeconds < 0 {
+		return fmt.Errorf("CHUNKGATE_CORS_MAX_AGE_SECONDS must be >= 0")
+	}
+	if c.CORSAllowCredentials {
+		for _, origin := range c.CORSAllowedOrigins {
+			if strings.TrimSpace(origin) == "*" {
+				return fmt.Errorf("CHUNKGATE_CORS_ALLOW_CREDENTIALS cannot be true when CHUNKGATE_CORS_ALLOWED_ORIGINS contains *")
+			}
+		}
+	}
 	if !c.AuthAllowAnonymous && len(c.AuthCredentials) == 0 {
 		return fmt.Errorf("configure CHUNKGATE_CREDENTIALS or set CHUNKGATE_ALLOW_ANONYMOUS=true for local development")
 	}
@@ -350,6 +375,27 @@ func envBool(key string, fallback bool) bool {
 		return fallback
 	}
 	return parsed
+}
+
+func envList(key string) []string {
+	value := os.Getenv(key)
+	if value == "" {
+		return nil
+	}
+	fields := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
+	out := make([]string, 0, len(fields))
+	seen := map[string]bool{}
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" || seen[field] {
+			continue
+		}
+		seen[field] = true
+		out = append(out, field)
+	}
+	return out
 }
 
 func envDurationSeconds(key string, fallback time.Duration) time.Duration {

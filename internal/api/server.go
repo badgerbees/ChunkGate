@@ -1,6 +1,9 @@
 package api
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -34,6 +37,8 @@ type Server struct {
 	readinessTimeout  time.Duration
 	debugPprofEnabled bool
 	anonymousTenant   string
+	virtualHosts      []string
+	cors              CORSConfig
 }
 
 type Option func(*Server)
@@ -100,6 +105,18 @@ func WithAnonymousTenant(tenant string) Option {
 	}
 }
 
+func WithVirtualHosts(hosts ...string) Option {
+	return func(server *Server) {
+		server.virtualHosts = normalizeVirtualHosts(hosts)
+	}
+}
+
+func WithCORS(config CORSConfig) Option {
+	return func(server *Server) {
+		server.cors = config.normalized()
+	}
+}
+
 func NewServer(objects *object.Service, multipartManager *multipart.Manager, options ...Option) *Server {
 	server := &Server{
 		objects:          objects,
@@ -125,6 +142,8 @@ func NewServer(objects *object.Service, multipartManager *multipart.Manager, opt
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
+	requestID := generateRequestID()
+	r = r.WithContext(context.WithValue(r.Context(), requestIDContextKey{}, requestID))
 	recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	finish := s.metrics.StartRequest()
 	defer func() {
@@ -134,6 +153,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.logger.Info("http_request",
 				"method", r.Method,
 				"path", r.URL.Path,
+				"request_id", requestID,
 				"status", recorder.status,
 				"bytes", recorder.bytes,
 				"duration_ms", float64(duration.Microseconds())/1000,
@@ -166,7 +186,10 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	addCommonHeaders(w)
+	addCommonHeaders(w, requestIDFromContext(r.Context()))
+	if s.handleCORS(w, r) {
+		return
+	}
 
 	identity, ok := s.authenticate(w, r)
 	if !ok {
@@ -177,7 +200,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target, ok := parseS3Path(r.URL.EscapedPath())
+	target, ok := parseS3Target(r, s.virtualHosts)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "InvalidURI", "could not parse the specified URI")
 		return
@@ -217,4 +240,21 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "the specified method is not allowed against this resource")
 	}
+}
+
+type requestIDContextKey struct{}
+
+func requestIDFromContext(ctx context.Context) string {
+	if value, ok := ctx.Value(requestIDContextKey{}).(string); ok && value != "" {
+		return value
+	}
+	return "chunkgate"
+}
+
+func generateRequestID() string {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err == nil {
+		return "cg-" + hex.EncodeToString(raw[:])
+	}
+	return "cg-" + hex.EncodeToString([]byte(time.Now().UTC().Format("20060102150405.000000000")))
 }

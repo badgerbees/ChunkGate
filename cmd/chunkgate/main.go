@@ -131,6 +131,15 @@ func main() {
 		api.WithBodyLimits(cfg.MaxObjectBytes, cfg.MultipartMaxPartBytes, cfg.CompleteXMLMaxBytes),
 		api.WithReadinessTimeout(cfg.ReadinessTimeout),
 		api.WithPprof(cfg.DebugPprofEnabled),
+		api.WithVirtualHosts(cfg.VirtualHosts...),
+		api.WithCORS(api.CORSConfig{
+			AllowedOrigins:   cfg.CORSAllowedOrigins,
+			AllowedMethods:   cfg.CORSAllowedMethods,
+			AllowedHeaders:   cfg.CORSAllowedHeaders,
+			ExposedHeaders:   cfg.CORSExposedHeaders,
+			AllowCredentials: cfg.CORSAllowCredentials,
+			MaxAgeSeconds:    cfg.CORSMaxAgeSeconds,
+		}),
 	}
 	if cfg.AuthAllowAnonymous {
 		apiOptions = append(apiOptions, api.WithAnonymousTenant("default"))

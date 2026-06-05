@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -72,6 +73,72 @@ func parseS3Path(escapedPath string) (s3Path, bool) {
 		return s3Path{}, false
 	}
 	return s3Path{Bucket: bucket, Key: key, HasBucket: true, HasKey: true}, true
+}
+
+func parseS3Target(r *http.Request, virtualHosts []string) (s3Path, bool) {
+	host := normalizeHost(r.Host)
+	for _, virtualHost := range virtualHosts {
+		if host == "" || virtualHost == "" || host == virtualHost {
+			continue
+		}
+		suffix := "." + virtualHost
+		if !strings.HasSuffix(host, suffix) {
+			continue
+		}
+		bucket := strings.TrimSuffix(host, suffix)
+		if bucket == "" {
+			continue
+		}
+		return parseVirtualHostedS3Path(bucket, r.URL.EscapedPath())
+	}
+	return parseS3Path(r.URL.EscapedPath())
+}
+
+func parseVirtualHostedS3Path(bucket string, escapedPath string) (s3Path, bool) {
+	keyEscaped := strings.TrimPrefix(escapedPath, "/")
+	if keyEscaped == "" {
+		return s3Path{Bucket: bucket, HasBucket: true}, true
+	}
+	key, err := url.PathUnescape(keyEscaped)
+	if err != nil || key == "" {
+		return s3Path{}, false
+	}
+	return s3Path{Bucket: bucket, Key: key, HasBucket: true, HasKey: true}, true
+}
+
+func normalizeVirtualHosts(hosts []string) []string {
+	normalized := make([]string, 0, len(hosts))
+	seen := map[string]bool{}
+	for _, host := range hosts {
+		host = normalizeHost(host)
+		if host == "" || seen[host] {
+			continue
+		}
+		seen[host] = true
+		normalized = append(normalized, host)
+	}
+	return normalized
+}
+
+func normalizeHost(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	if parsed, err := url.Parse(host); err == nil && parsed.Host != "" {
+		host = parsed.Host
+	}
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	} else if strings.Count(host, ":") == 1 {
+		if beforePort, _, found := strings.Cut(host, ":"); found {
+			host = beforePort
+		}
+	}
+	host = strings.TrimPrefix(host, "[")
+	host = strings.TrimSuffix(host, "]")
+	host = strings.TrimSuffix(host, ".")
+	return strings.ToLower(host)
 }
 
 func hasSubresource(r *http.Request, name string) bool {

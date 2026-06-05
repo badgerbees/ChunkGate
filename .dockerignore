@@ -2,6 +2,7 @@
 .github
 data
 tmp
+dist
 chunkgate
 chunkgate.exe
 chunkgate-delta

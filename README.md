@@ -1,32 +1,19 @@
 # ChunkGate
 
-ChunkGate is a self-hosted S3-compatible deduplication proxy written in Go. It exposes a normal object endpoint to clients while storing incoming streams as content-defined chunks behind the scenes.
+ChunkGate is a self-hosted S3-compatible deduplication proxy that sits between your existing S3 clients and storage backend, accepts normal object uploads and downloads, splits repeated data into reusable chunks, and stores those chunks in tenant-isolated filesystem or S3-compatible storage while keeping the client experience the same as using ordinary S3.
 
-This repository currently contains the deployable base architecture:
+Key features:
 
-- S3-like `PUT`, `GET`, `HEAD`, `DELETE`, and multipart initiate/upload/complete/abort routes.
-- AWS Signature Version 4 verification when local credentials are configured.
-- Tenant isolation derived from authenticated access keys.
-- Bucket-level SDK compatibility routes for list, create, head, delete, and empty object listings.
-- Object header preservation for common HTTP headers and `x-amz-meta-*` metadata.
-- Single-range `GET` and `HEAD` support with manifest-driven chunk selection.
-- Streaming FastCDC chunking powered by a production Gear-hash engine, with a built-in fallback engine.
-- Tenant-sharded SQLite metadata files under `data/metadata/tenant_{id}.db`.
-- Migration-managed structured metadata tables for objects, chunks, blocks, and multipart state.
-- Optional PostgreSQL metadata backend for horizontally scaled ChunkGate replicas.
-- Tenant-scoped filesystem block storage under `data/backend`.
-- Optional AES-GCM encryption for local filesystem blocks.
-- Durable sequential multipart spooling under `data/scratch`, with restart reload and stale upload cleanup.
-- Atomic local capacity reservations for multipart upload initiation.
-- Adaptive CPU concurrency gating around chunk processing with configurable headroom.
-- Scratch disk free-space checks combined with atomic multipart reservations.
-- Request body limits for objects, parts, and multipart completion XML.
-- Structured JSON request logging.
-- Background soft-delete GC with orphan-age protection, provider-sized bulk deletes, retries, and metrics.
-- Health, readiness, Prometheus metrics, and optional gated pprof debug endpoints.
-- Versioned companion manifest/chunk API for ChunkGate-aware delta downloads.
-- Proof-of-concept `chunkgate-delta` client with a local verified block cache.
-- Pluggable block backends: local filesystem by default, or S3-compatible storage for AWS S3, MinIO, Cloudflare R2, and similar providers.
+- S3-compatible object, bucket, multipart upload, and range-read APIs.
+- SigV4 authentication with tenant isolation derived from access keys.
+- Path-style and configurable virtual-hosted-style bucket addressing.
+- Static CORS preflight/response headers for browser and SDK clients.
+- Streaming FastCDC deduplication with tenant-scoped block storage.
+- SQLite by default, with PostgreSQL support for shared metadata deployments.
+- Filesystem or S3-compatible block backends, including MinIO, AWS S3, Cloudflare R2, and similar services.
+- Background garbage collection, health/readiness checks, Prometheus metrics, and structured logs.
+- Optional ChunkGate-aware delta downloads through manifests and the `chunkgate-delta` client.
+- Docker, Compose, Kubernetes, sample config, backup, upgrade, release, SBOM, and vulnerability-scanning support.
 
 ## Run Locally
 
@@ -58,6 +45,8 @@ docker compose up -d postgres
 ```
 
 The Compose PostgreSQL service is exposed on host port `15432` to avoid colliding with an existing local PostgreSQL install.
+
+Production Compose and Kubernetes examples are documented in [docs/deployment.md](docs/deployment.md).
 
 ## Configuration
 
@@ -108,6 +97,13 @@ The Compose PostgreSQL service is exposed on host port `15432` to avoid collidin
 | `CHUNKGATE_READINESS_TIMEOUT_SECONDS` | `3` |
 | `CHUNKGATE_SHUTDOWN_TIMEOUT_SECONDS` | `15` |
 | `CHUNKGATE_DEBUG_PPROF_ENABLED` | `false` |
+| `CHUNKGATE_VIRTUAL_HOSTS` | unset, comma-separated endpoint hostnames for `bucket.host/key` routing |
+| `CHUNKGATE_CORS_ALLOWED_ORIGINS` | unset, comma-separated origins or `*` |
+| `CHUNKGATE_CORS_ALLOWED_METHODS` | `GET, HEAD, PUT, POST, DELETE` when CORS is enabled |
+| `CHUNKGATE_CORS_ALLOWED_HEADERS` | `*` when CORS is enabled |
+| `CHUNKGATE_CORS_EXPOSED_HEADERS` | `ETag, Content-Length, Content-Range, x-amz-request-id` |
+| `CHUNKGATE_CORS_ALLOW_CREDENTIALS` | `false` |
+| `CHUNKGATE_CORS_MAX_AGE_SECONDS` | `3600` |
 | `CHUNKGATE_ALLOW_ANONYMOUS` | `false` |
 | `CHUNKGATE_ACCESS_KEY_ID` | unset |
 | `CHUNKGATE_SECRET_ACCESS_KEY` | unset |
@@ -186,3 +182,9 @@ The core object service depends on `backend.BlockStore`, so filesystem and S3-co
 ChunkGate-aware clients can use the manifest-first delta protocol documented in [docs/delta-protocol.md](docs/delta-protocol.md). Ordinary S3 clients continue to use full-object `GET`, `HEAD`, and range reads.
 
 Security assumptions and remaining risks are documented in [docs/threat-model.md](docs/threat-model.md).
+
+Operational runbooks:
+
+- [docs/backup-restore.md](docs/backup-restore.md)
+- [docs/upgrade.md](docs/upgrade.md)
+- [docs/release.md](docs/release.md)
