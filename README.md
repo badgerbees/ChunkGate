@@ -1,6 +1,6 @@
 # ChunkGate
 
-ChunkGate is a self-hosted S3-compatible deduplication proxy that sits between your existing S3 clients and storage backend, accepts normal object uploads and downloads, splits repeated data into reusable chunks, and stores those chunks in tenant-isolated filesystem or S3-compatible storage while keeping the client experience the same as using ordinary S3.
+ChunkGate is a self-hosted proxy that sits in front of S3-compatible storage and helps reduce storage usage automatically. Your apps keep using normal S3 uploads and downloads, while ChunkGate breaks files into reusable chunks, stores repeated data only once per tenant, and rebuilds the original object when it is read back.
 
 Key features:
 
