@@ -2,7 +2,9 @@ package backend
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -54,6 +56,116 @@ func TestNormalizeEndpointKeepsSupabaseBasePath(t *testing.T) {
 	}
 }
 
+func TestNormalizeS3ProviderAliases(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want string
+	}{
+		{"", S3ProviderGeneric},
+		{"generic", S3ProviderGeneric},
+		{"aws-s3", S3ProviderAWS},
+		{"AWS", S3ProviderAWS},
+		{"cloudflare-r2", S3ProviderR2},
+		{"r2", S3ProviderR2},
+		{"backblaze-b2", S3ProviderB2},
+		{"b2", S3ProviderB2},
+		{"supabase", S3ProviderSupabase},
+		{"minio", S3ProviderMinIO},
+	} {
+		if got := NormalizeS3Provider(tc.in); got != tc.want {
+			t.Fatalf("NormalizeS3Provider(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestNewS3StoreKeepsMinIOSDKForHostOnlyEndpoints(t *testing.T) {
+	store, err := NewS3Store(S3Options{
+		Endpoint:  "localhost:9000",
+		Bucket:    "chunkgate-blocks",
+		PathStyle: true,
+	})
+	if err != nil {
+		t.Fatalf("create s3 store failed: %v", err)
+	}
+	if _, ok := store.client.(minioS3Client); !ok {
+		t.Fatalf("client type = %T, want minioS3Client", store.client)
+	}
+}
+
+func TestNewS3StoreUsesPathClientForBasePathEndpoints(t *testing.T) {
+	store, err := NewS3Store(S3Options{
+		Endpoint:  "https://project-ref.storage.supabase.co/storage/v1/s3",
+		Provider:  S3ProviderSupabase,
+		Bucket:    "chunkgate-blocks",
+		PathStyle: true,
+	})
+	if err != nil {
+		t.Fatalf("create s3 store failed: %v", err)
+	}
+	if _, ok := store.client.(*pathS3Client); !ok {
+		t.Fatalf("client type = %T, want *pathS3Client", store.client)
+	}
+	if store.provider != S3ProviderSupabase {
+		t.Fatalf("provider = %q, want supabase", store.provider)
+	}
+}
+
+func TestNewS3StoreConfiguresBackblazeB2Preset(t *testing.T) {
+	store, err := NewS3Store(S3Options{
+		Endpoint:   "https://s3.us-west-004.backblazeb2.com",
+		Provider:   "backblaze-b2",
+		Region:     "us-west-004",
+		Bucket:     "chunkgate-blocks",
+		AccessKey:  "key-id",
+		SecretKey:  "application-key",
+		PathStyle:  true,
+		Timeout:    time.Second,
+		MaxRetries: 1,
+	})
+	if err != nil {
+		t.Fatalf("create b2 s3 store failed: %v", err)
+	}
+	if store.provider != S3ProviderB2 {
+		t.Fatalf("provider = %q, want b2", store.provider)
+	}
+	if store.deleteBatchSize != defaultS3DeleteObjectsLimit {
+		t.Fatalf("delete batch size = %d, want %d", store.deleteBatchSize, defaultS3DeleteObjectsLimit)
+	}
+	if _, ok := store.client.(minioS3Client); !ok {
+		t.Fatalf("client type = %T, want minioS3Client for host-only b2 endpoint", store.client)
+	}
+}
+
+func TestPathS3ClientBuildsPathStyleURL(t *testing.T) {
+	endpoint, err := normalizeEndpoint("https://storage.example.test/storage/v1/s3", false)
+	if err != nil {
+		t.Fatalf("normalize endpoint failed: %v", err)
+	}
+	client := newPathS3Client(pathS3Options{Endpoint: endpoint, PathStyle: true})
+	target := client.objectURL("chunkgate-blocks", "tenants/tenant-a/blocks/aa/hash")
+	if target.Scheme != "https" || target.Host != "storage.example.test" {
+		t.Fatalf("target = %s, want https://storage.example.test", target.String())
+	}
+	if target.Path != "/storage/v1/s3/chunkgate-blocks/tenants/tenant-a/blocks/aa/hash" {
+		t.Fatalf("path = %q", target.Path)
+	}
+}
+
+func TestPathS3ClientBuildsVirtualHostStyleURL(t *testing.T) {
+	endpoint, err := normalizeEndpoint("https://storage.example.test/storage/v1/s3", false)
+	if err != nil {
+		t.Fatalf("normalize endpoint failed: %v", err)
+	}
+	client := newPathS3Client(pathS3Options{Endpoint: endpoint, PathStyle: false})
+	target := client.objectURL("chunkgate-blocks", "tenants/tenant-a/blocks/aa/hash")
+	if target.Scheme != "https" || target.Host != "chunkgate-blocks.storage.example.test" {
+		t.Fatalf("target = %s, want virtual-host style bucket host", target.String())
+	}
+	if target.Path != "/storage/v1/s3/tenants/tenant-a/blocks/aa/hash" {
+		t.Fatalf("path = %q", target.Path)
+	}
+}
+
 func TestWrapS3ErrorClassifiesNotFoundAndUnavailable(t *testing.T) {
 	notFound := minio.ErrorResponse{Code: "NoSuchKey", StatusCode: http.StatusNotFound}
 	if err := wrapS3Error("get block", "key", notFound); !errors.Is(err, ErrBlockNotFound) {
@@ -63,6 +175,28 @@ func TestWrapS3ErrorClassifiesNotFoundAndUnavailable(t *testing.T) {
 	unavailable := minio.ErrorResponse{Code: "SlowDown", StatusCode: http.StatusServiceUnavailable}
 	if err := wrapS3Error("put block", "key", unavailable); !errors.Is(err, ErrBackendUnavailable) {
 		t.Fatalf("unavailable err = %v", err)
+	}
+}
+
+func TestS3StoreDeleteBlocksBatchesDeleteObjects(t *testing.T) {
+	client := &recordingS3Client{}
+	store := &S3Store{
+		client:          client,
+		bucket:          "chunkgate-blocks",
+		deleteBatchSize: defaultS3DeleteObjectsLimit,
+	}
+	hashes := make([]string, 0, defaultS3DeleteObjectsLimit+1)
+	for i := 0; i < defaultS3DeleteObjectsLimit+1; i++ {
+		hashes = append(hashes, fmt.Sprintf("%064x", i+1))
+	}
+	if err := store.DeleteBlocks(context.Background(), "tenant-a", hashes); err != nil {
+		t.Fatalf("delete blocks failed: %v", err)
+	}
+	if len(client.deleteCalls) != 2 {
+		t.Fatalf("delete calls = %d, want 2", len(client.deleteCalls))
+	}
+	if len(client.deleteCalls[0]) != defaultS3DeleteObjectsLimit || len(client.deleteCalls[1]) != 1 {
+		t.Fatalf("delete call sizes = %d, %d", len(client.deleteCalls[0]), len(client.deleteCalls[1]))
 	}
 }
 
@@ -113,18 +247,15 @@ func TestS3StoreSupportsPathBasedS3Endpoints(t *testing.T) {
 			_, _ = w.Write(data)
 		case r.Method == http.MethodPost && r.URL.RawQuery == "delete=":
 			sawDelete = true
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Errorf("read delete body failed: %v", err)
-				http.Error(w, "read delete", http.StatusInternalServerError)
+			var request deleteRequest
+			if err := xml.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Errorf("decode delete body failed: %v", err)
+				http.Error(w, "decode delete body", http.StatusInternalServerError)
 				return
 			}
-			if !strings.Contains(string(body), "<Key>"+key+"</Key>") && !strings.Contains(string(body), "<Key>tenants/tenant-a/blocks/01/"+testBlockHash+"</Key>") {
-				t.Errorf("delete body = %s", body)
-				http.Error(w, "bad delete body", http.StatusInternalServerError)
-				return
+			for _, object := range request.Objects {
+				delete(objects, object.Key)
 			}
-			delete(objects, "tenants/tenant-a/blocks/01/"+testBlockHash)
 			w.Header().Set("Content-Type", "application/xml")
 			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><DeleteResult></DeleteResult>`))
 		default:
@@ -147,39 +278,12 @@ func TestS3StoreSupportsPathBasedS3Endpoints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create path s3 store failed: %v", err)
 	}
-	ctx := context.Background()
-	if err := store.HealthCheck(ctx); err != nil {
-		t.Fatalf("health check failed: %v", err)
-	}
-	if ok, err := store.HasBlock(ctx, "tenant-a", testBlockHash); err != nil || ok {
-		t.Fatalf("initial has block ok=%v err=%v, want false nil", ok, err)
-	}
-	if err := store.PutBlock(ctx, "tenant-a", testBlockHash, []byte("payload")); err != nil {
-		t.Fatalf("put block failed: %v", err)
-	}
-	if ok, err := store.HasBlock(ctx, "tenant-a", testBlockHash); err != nil || !ok {
-		t.Fatalf("has block ok=%v err=%v, want true nil", ok, err)
-	}
-	reader, err := store.GetBlock(ctx, "tenant-a", testBlockHash)
-	if err != nil {
-		t.Fatalf("get block failed: %v", err)
-	}
-	data, err := io.ReadAll(reader)
-	reader.Close()
-	if err != nil {
-		t.Fatalf("read block failed: %v", err)
-	}
-	if string(data) != "payload" {
-		t.Fatalf("payload = %q", data)
-	}
-	if err := store.DeleteBlocks(ctx, "tenant-a", []string{testBlockHash}); err != nil {
-		t.Fatalf("delete block failed: %v", err)
-	}
+	RunBlockStoreContract(t, func(t *testing.T) BlockStore {
+		t.Helper()
+		return store
+	})
 	if !sawDelete {
 		t.Fatal("delete objects request was not observed")
-	}
-	if ok, err := store.HasBlock(ctx, "tenant-a", testBlockHash); err != nil || ok {
-		t.Fatalf("has deleted block ok=%v err=%v, want false nil", ok, err)
 	}
 }
 
@@ -239,35 +343,42 @@ func TestS3StoreIntegrationMinIO(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create s3 store failed: %v", err)
 	}
+	RunBlockStoreContract(t, func(t *testing.T) BlockStore {
+		t.Helper()
+		return store
+	})
+}
 
-	hash := testBlockHash
-	if ok, err := store.HasBlock(ctx, "tenant-a", hash); err != nil || ok {
-		t.Fatalf("initial has block ok=%v err=%v, want false nil", ok, err)
+func TestS3StoreIntegrationBackblazeB2(t *testing.T) {
+	endpoint := os.Getenv("CHUNKGATE_B2_TEST_ENDPOINT")
+	bucket := os.Getenv("CHUNKGATE_B2_TEST_BUCKET")
+	accessKey := os.Getenv("CHUNKGATE_B2_TEST_KEY_ID")
+	secretKey := os.Getenv("CHUNKGATE_B2_TEST_APPLICATION_KEY")
+	if endpoint == "" || bucket == "" || accessKey == "" || secretKey == "" {
+		t.Skip("set CHUNKGATE_B2_TEST_ENDPOINT, CHUNKGATE_B2_TEST_BUCKET, CHUNKGATE_B2_TEST_KEY_ID, and CHUNKGATE_B2_TEST_APPLICATION_KEY to run the B2 integration test")
 	}
-	if err := store.PutBlock(ctx, "tenant-a", hash, []byte("payload")); err != nil {
-		t.Fatalf("put block failed: %v", err)
-	}
-	if ok, err := store.HasBlock(ctx, "tenant-a", hash); err != nil || !ok {
-		t.Fatalf("has block ok=%v err=%v, want true nil", ok, err)
-	}
-	reader, err := store.GetBlock(ctx, "tenant-a", hash)
+
+	secure := !strings.EqualFold(os.Getenv("CHUNKGATE_B2_TEST_USE_TLS"), "false")
+	store, err := NewS3Store(S3Options{
+		Endpoint:   endpoint,
+		Provider:   S3ProviderB2,
+		Region:     envOr("CHUNKGATE_B2_TEST_REGION", "us-west-004"),
+		Bucket:     bucket,
+		AccessKey:  accessKey,
+		SecretKey:  secretKey,
+		Prefix:     envOr("CHUNKGATE_B2_TEST_PREFIX", "live-b2/"+time.Now().UTC().Format("20060102150405.000000000")),
+		Secure:     secure,
+		PathStyle:  true,
+		Timeout:    15 * time.Second,
+		MaxRetries: 2,
+	})
 	if err != nil {
-		t.Fatalf("get block failed: %v", err)
+		t.Fatalf("create b2 s3 store failed: %v", err)
 	}
-	data, err := io.ReadAll(reader)
-	reader.Close()
-	if err != nil {
-		t.Fatalf("read block failed: %v", err)
-	}
-	if string(data) != "payload" {
-		t.Fatalf("payload = %q", data)
-	}
-	if err := store.DeleteBlocks(ctx, "tenant-a", []string{hash}); err != nil {
-		t.Fatalf("delete block failed: %v", err)
-	}
-	if ok, err := store.HasBlock(ctx, "tenant-a", hash); err != nil || ok {
-		t.Fatalf("has deleted block ok=%v err=%v, want false nil", ok, err)
-	}
+	RunBlockStoreContract(t, func(t *testing.T) BlockStore {
+		t.Helper()
+		return store
+	})
 }
 
 func envOr(key string, fallback string) string {
@@ -281,4 +392,35 @@ func writeS3TestError(w http.ResponseWriter, status int, code string) {
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(status)
 	_, _ = w.Write([]byte(`<Error><Code>` + code + `</Code><Message>` + code + `</Message></Error>`))
+}
+
+type recordingS3Client struct {
+	deleteCalls [][]string
+}
+
+func (c *recordingS3Client) PutObject(ctx context.Context, bucket string, key string, data []byte) error {
+	return ctx.Err()
+}
+
+func (c *recordingS3Client) GetObject(ctx context.Context, bucket string, key string) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return io.NopCloser(strings.NewReader("")), nil
+}
+
+func (c *recordingS3Client) StatObject(ctx context.Context, bucket string, key string) error {
+	return ctx.Err()
+}
+
+func (c *recordingS3Client) DeleteObjects(ctx context.Context, bucket string, keys []string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.deleteCalls = append(c.deleteCalls, append([]string(nil), keys...))
+	return nil
+}
+
+func (c *recordingS3Client) BucketExists(ctx context.Context, bucket string) (bool, error) {
+	return ctx.Err() == nil, ctx.Err()
 }

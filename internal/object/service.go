@@ -98,7 +98,7 @@ func (s *Service) Put(ctx context.Context, tenant string, bucket string, key str
 		hash := sha256.Sum256(chunk.Data)
 		blockID := hex.EncodeToString(hash[:])
 		if !seenBlocks[blockID] {
-			exists, err := s.hasBlock(ctx, tenant, blockID)
+			exists, err := s.backend.HasBlock(ctx, tenant, blockID)
 			if err != nil {
 				return err
 			}
@@ -139,18 +139,6 @@ func (s *Service) Put(ctx context.Context, tenant string, bucket string, key str
 		s.metrics.ObserveUpload(size, chunks)
 	}
 	return s.store.GetObject(ctx, tenant, bucket, key)
-}
-
-type blockExistenceChecker interface {
-	HasBlock(ctx context.Context, tenant string, hash string) (bool, error)
-}
-
-func (s *Service) hasBlock(ctx context.Context, tenant string, hash string) (bool, error) {
-	checker, ok := s.backend.(blockExistenceChecker)
-	if !ok {
-		return false, nil
-	}
-	return checker.HasBlock(ctx, tenant, hash)
 }
 
 func (s *Service) Open(ctx context.Context, tenant string, bucket string, key string) (metadata.ObjectManifest, io.ReadCloser, error) {

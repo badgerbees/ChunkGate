@@ -43,12 +43,47 @@ jobs:
           done
           docker logs chunkgate-minio
           exit 1
+      - name: Start Azurite
+        run: |
+          docker run -d --name chunkgate-azurite \
+            -p 10000:10000 \
+            mcr.microsoft.com/azure-storage/azurite:latest \
+            azurite-blob --blobHost 0.0.0.0 --location /data --skipApiVersionCheck
+          for i in $(seq 1 60); do
+            if curl -sS http://localhost:10000/devstoreaccount1 >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs chunkgate-azurite
+          exit 1
+      - name: Start fake-gcs-server
+        run: |
+          docker run -d --name chunkgate-fake-gcs \
+            -p 4443:4443 \
+            fsouza/fake-gcs-server:latest \
+            -scheme http -host 0.0.0.0 -port 4443
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:4443/storage/v1/b >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs chunkgate-fake-gcs
+          exit 1
       - run: go test ./...
         env:
           CHUNKGATE_S3_TEST_ENDPOINT: http://localhost:9000
           CHUNKGATE_S3_TEST_BUCKET: chunkgate-test
           CHUNKGATE_S3_TEST_ACCESS_KEY_ID: minioadmin
           CHUNKGATE_S3_TEST_SECRET_ACCESS_KEY: minioadmin
+          CHUNKGATE_AZURE_TEST_ENDPOINT: http://localhost:10000/devstoreaccount1
+          CHUNKGATE_AZURE_TEST_ACCOUNT_NAME: devstoreaccount1
+          CHUNKGATE_AZURE_TEST_ACCOUNT_KEY: Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
+          CHUNKGATE_AZURE_TEST_CONTAINER: chunkgate-test
+          CHUNKGATE_GCS_TEST_ENDPOINT: http://localhost:4443/storage/v1/
+          CHUNKGATE_GCS_TEST_BUCKET: chunkgate-test
+          CHUNKGATE_GCS_TEST_PROJECT_ID: chunkgate-test
           CHUNKGATE_POSTGRES_TEST_DSN: postgres://chunkgate:chunkgate@localhost:5432/chunkgate?sslmode=disable
       - run: go vet ./...
       - run: go build -o /tmp/chunkgate ./cmd/chunkgate

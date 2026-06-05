@@ -176,6 +176,14 @@ func (s *countingBlockStore) DeleteBlocks(ctx context.Context, tenant string, ha
 	return s.inner.DeleteBlocks(ctx, tenant, hashes)
 }
 
+func (s *countingBlockStore) HasBlock(ctx context.Context, tenant string, hash string) (bool, error) {
+	return s.inner.HasBlock(ctx, tenant, hash)
+}
+
+func (s *countingBlockStore) HealthCheck(ctx context.Context) error {
+	return s.inner.HealthCheck(ctx)
+}
+
 type dedupeBlockStore struct {
 	blocks map[string][]byte
 	puts   int
@@ -216,6 +224,10 @@ func (s *dedupeBlockStore) HasBlock(ctx context.Context, tenant string, hash str
 	}
 	_, ok := s.blocks[tenant+"\x00"+hash]
 	return ok, nil
+}
+
+func (s *dedupeBlockStore) HealthCheck(ctx context.Context) error {
+	return ctx.Err()
 }
 
 type cancelAfterFirstRead struct {

@@ -32,6 +32,16 @@ const (
 	defaultScratchFree  = int64(1024 * 1024 * 1024)
 	defaultCompleteXML  = int64(1024 * 1024)
 	defaultAuthAnon     = false
+	defaultAzureAuth    = "auto"
+	defaultAzureTimeout = 30 * time.Second
+	defaultAzureRetries = 3
+	defaultGCSAuth      = "auto"
+	defaultGCSTimeout   = 30 * time.Second
+	defaultGCSRetries   = 3
+	defaultSwiftAuth    = "auto"
+	defaultSwiftTimeout = 30 * time.Second
+	defaultSwiftRetries = 3
+	defaultS3Provider   = "generic"
 	defaultS3Region     = "us-east-1"
 	defaultS3UseTLS     = true
 	defaultS3PathStyle  = true
@@ -51,119 +61,193 @@ const (
 )
 
 type Config struct {
-	ListenAddr              string
-	DataDir                 string
-	MetadataProvider        string
-	MetadataDir             string
-	BackendDir              string
-	ScratchDir              string
-	BackendProvider         string
-	LocalBlockEncryptionKey string
-	LocalCapacityBytes      int64
-	MaxConcurrentChunkers   int
-	CPUHeadroomCores        int
-	SmallFileThresholdBytes int
-	ChunkMinBytes           int
-	ChunkAvgBytes           int
-	ChunkMaxBytes           int
-	ChunkEngine             string
-	MultipartMaxPartBytes   int64
-	MultipartMaxUploadBytes int64
-	MultipartStaleTTL       time.Duration
-	ScratchMinFreeBytes     int64
-	MaxObjectBytes          int64
-	CompleteXMLMaxBytes     int64
-	S3Endpoint              string
-	S3Region                string
-	S3Bucket                string
-	S3AccessKey             string
-	S3SecretKey             string
-	S3SessionToken          string
-	S3Prefix                string
-	S3UseTLS                bool
-	S3PathStyle             bool
-	S3Timeout               time.Duration
-	S3MaxRetries            int
-	GCEnabled               bool
-	GCInterval              time.Duration
-	GCMinOrphanAge          time.Duration
-	GCBatchSize             int
-	GCMaxRetries            int
-	PostgresDSN             string
-	PostgresMaxOpenConns    int
-	PostgresMaxIdleConns    int
-	PostgresConnMaxLifetime time.Duration
-	ReadinessTimeout        time.Duration
-	ShutdownTimeout         time.Duration
-	DebugPprofEnabled       bool
-	VirtualHosts            []string
-	CORSAllowedOrigins      []string
-	CORSAllowedMethods      []string
-	CORSAllowedHeaders      []string
-	CORSExposedHeaders      []string
-	CORSAllowCredentials    bool
-	CORSMaxAgeSeconds       int
-	AuthAllowAnonymous      bool
-	AuthCredentials         []s3auth.Credential
+	ListenAddr                 string
+	DataDir                    string
+	MetadataProvider           string
+	MetadataDir                string
+	BackendDir                 string
+	ScratchDir                 string
+	BackendProvider            string
+	LocalBlockEncryptionKey    string
+	LocalCapacityBytes         int64
+	MaxConcurrentChunkers      int
+	CPUHeadroomCores           int
+	SmallFileThresholdBytes    int
+	ChunkMinBytes              int
+	ChunkAvgBytes              int
+	ChunkMaxBytes              int
+	ChunkEngine                string
+	MultipartMaxPartBytes      int64
+	MultipartMaxUploadBytes    int64
+	MultipartStaleTTL          time.Duration
+	ScratchMinFreeBytes        int64
+	MaxObjectBytes             int64
+	CompleteXMLMaxBytes        int64
+	S3Endpoint                 string
+	S3Provider                 string
+	S3Region                   string
+	S3Bucket                   string
+	S3AccessKey                string
+	S3SecretKey                string
+	S3SessionToken             string
+	S3Prefix                   string
+	S3UseTLS                   bool
+	S3PathStyle                bool
+	S3Timeout                  time.Duration
+	S3MaxRetries               int
+	AzureAccountName           string
+	AzureAccountKey            string
+	AzureEndpoint              string
+	AzureContainer             string
+	AzurePrefix                string
+	AzureAuth                  string
+	AzureTimeout               time.Duration
+	AzureMaxRetries            int
+	GCSProjectID               string
+	GCSBucket                  string
+	GCSEndpoint                string
+	GCSPrefix                  string
+	GCSCredentialsFile         string
+	GCSCredentialsJSON         string
+	GCSAuth                    string
+	GCSTimeout                 time.Duration
+	GCSMaxRetries              int
+	SwiftAuthURL               string
+	SwiftUsername              string
+	SwiftUserID                string
+	SwiftPassword              string
+	SwiftApplicationCredID     string
+	SwiftApplicationCredName   string
+	SwiftApplicationCredSecret string
+	SwiftProjectID             string
+	SwiftProjectName           string
+	SwiftDomainID              string
+	SwiftDomainName            string
+	SwiftRegion                string
+	SwiftContainer             string
+	SwiftEndpoint              string
+	SwiftPrefix                string
+	SwiftAuth                  string
+	SwiftInsecureSkipVerify    bool
+	SwiftTimeout               time.Duration
+	SwiftMaxRetries            int
+	GCEnabled                  bool
+	GCInterval                 time.Duration
+	GCMinOrphanAge             time.Duration
+	GCBatchSize                int
+	GCMaxRetries               int
+	PostgresDSN                string
+	PostgresMaxOpenConns       int
+	PostgresMaxIdleConns       int
+	PostgresConnMaxLifetime    time.Duration
+	ReadinessTimeout           time.Duration
+	ShutdownTimeout            time.Duration
+	DebugPprofEnabled          bool
+	VirtualHosts               []string
+	CORSAllowedOrigins         []string
+	CORSAllowedMethods         []string
+	CORSAllowedHeaders         []string
+	CORSExposedHeaders         []string
+	CORSAllowCredentials       bool
+	CORSMaxAgeSeconds          int
+	AuthAllowAnonymous         bool
+	AuthCredentials            []s3auth.Credential
 }
 
 func FromEnv() Config {
 	dataDir := envString("CHUNKGATE_DATA_DIR", defaultDataDir)
 	return Config{
-		ListenAddr:              envString("CHUNKGATE_LISTEN", defaultListen),
-		DataDir:                 dataDir,
-		MetadataProvider:        envString("CHUNKGATE_METADATA", defaultMetadata),
-		MetadataDir:             envString("CHUNKGATE_METADATA_DIR", filepath.Join(dataDir, "metadata")),
-		BackendDir:              envString("CHUNKGATE_BACKEND_DIR", filepath.Join(dataDir, "backend")),
-		ScratchDir:              envString("CHUNKGATE_SCRATCH_DIR", filepath.Join(dataDir, "scratch")),
-		BackendProvider:         envString("CHUNKGATE_BACKEND", defaultBackend),
-		LocalBlockEncryptionKey: envString("CHUNKGATE_LOCAL_BLOCK_ENCRYPTION_KEY", ""),
-		LocalCapacityBytes:      envInt64("CHUNKGATE_LOCAL_CAPACITY_BYTES", defaultLocalCap),
-		MaxConcurrentChunkers:   envInt("CHUNKGATE_MAX_CONCURRENT_CHUNKERS", defaultChunkWorkers),
-		CPUHeadroomCores:        envInt("CHUNKGATE_CPU_HEADROOM_CORES", defaultCPUHeadroom),
-		SmallFileThresholdBytes: envInt("CHUNKGATE_SMALL_FILE_THRESHOLD_BYTES", defaultSmallBypass),
-		ChunkMinBytes:           envInt("CHUNKGATE_CHUNK_MIN_BYTES", defaultChunkMin),
-		ChunkAvgBytes:           envInt("CHUNKGATE_CHUNK_AVG_BYTES", defaultChunkAvg),
-		ChunkMaxBytes:           envInt("CHUNKGATE_CHUNK_MAX_BYTES", defaultChunkMax),
-		ChunkEngine:             envString("CHUNKGATE_CHUNK_ENGINE", defaultChunkEngine),
-		MultipartMaxPartBytes:   envInt64("CHUNKGATE_MULTIPART_MAX_PART_BYTES", defaultPartMax),
-		MultipartMaxUploadBytes: envInt64("CHUNKGATE_MULTIPART_MAX_UPLOAD_BYTES", defaultLocalCap),
-		MultipartStaleTTL:       envDurationSeconds("CHUNKGATE_MULTIPART_STALE_TTL_SECONDS", defaultStaleTTL),
-		ScratchMinFreeBytes:     envInt64("CHUNKGATE_SCRATCH_MIN_FREE_BYTES", defaultScratchFree),
-		MaxObjectBytes:          envInt64("CHUNKGATE_MAX_OBJECT_BYTES", 0),
-		CompleteXMLMaxBytes:     envInt64("CHUNKGATE_COMPLETE_XML_MAX_BYTES", defaultCompleteXML),
-		S3Endpoint:              envString("CHUNKGATE_S3_ENDPOINT", ""),
-		S3Region:                envString("CHUNKGATE_S3_REGION", defaultS3Region),
-		S3Bucket:                envString("CHUNKGATE_S3_BUCKET", ""),
-		S3AccessKey:             envString("CHUNKGATE_S3_ACCESS_KEY_ID", os.Getenv("AWS_ACCESS_KEY_ID")),
-		S3SecretKey:             envString("CHUNKGATE_S3_SECRET_ACCESS_KEY", os.Getenv("AWS_SECRET_ACCESS_KEY")),
-		S3SessionToken:          envString("CHUNKGATE_S3_SESSION_TOKEN", os.Getenv("AWS_SESSION_TOKEN")),
-		S3Prefix:                envString("CHUNKGATE_S3_PREFIX", ""),
-		S3UseTLS:                envBool("CHUNKGATE_S3_USE_TLS", defaultS3UseTLS),
-		S3PathStyle:             envBool("CHUNKGATE_S3_PATH_STYLE", defaultS3PathStyle),
-		S3Timeout:               envDurationSeconds("CHUNKGATE_S3_TIMEOUT_SECONDS", defaultS3Timeout),
-		S3MaxRetries:            envInt("CHUNKGATE_S3_MAX_RETRIES", defaultS3Retries),
-		GCEnabled:               envBool("CHUNKGATE_GC_ENABLED", defaultGCEnabled),
-		GCInterval:              envDurationSeconds("CHUNKGATE_GC_INTERVAL_SECONDS", defaultGCInterval),
-		GCMinOrphanAge:          envDurationSeconds("CHUNKGATE_GC_MIN_ORPHAN_AGE_SECONDS", defaultGCMinAge),
-		GCBatchSize:             envInt("CHUNKGATE_GC_BATCH_SIZE", defaultGCBatchSize),
-		GCMaxRetries:            envInt("CHUNKGATE_GC_MAX_RETRIES", defaultGCRetries),
-		PostgresDSN:             envString("CHUNKGATE_POSTGRES_DSN", ""),
-		PostgresMaxOpenConns:    envInt("CHUNKGATE_POSTGRES_MAX_OPEN_CONNS", defaultPGMaxOpen),
-		PostgresMaxIdleConns:    envInt("CHUNKGATE_POSTGRES_MAX_IDLE_CONNS", defaultPGMaxIdle),
-		PostgresConnMaxLifetime: envDurationSeconds("CHUNKGATE_POSTGRES_CONN_MAX_LIFETIME_SECONDS", defaultPGLifetime),
-		ReadinessTimeout:        envDurationSeconds("CHUNKGATE_READINESS_TIMEOUT_SECONDS", defaultReadyTimeout),
-		ShutdownTimeout:         envDurationSeconds("CHUNKGATE_SHUTDOWN_TIMEOUT_SECONDS", defaultShutdown),
-		DebugPprofEnabled:       envBool("CHUNKGATE_DEBUG_PPROF_ENABLED", false),
-		VirtualHosts:            envList("CHUNKGATE_VIRTUAL_HOSTS"),
-		CORSAllowedOrigins:      envList("CHUNKGATE_CORS_ALLOWED_ORIGINS"),
-		CORSAllowedMethods:      envList("CHUNKGATE_CORS_ALLOWED_METHODS"),
-		CORSAllowedHeaders:      envList("CHUNKGATE_CORS_ALLOWED_HEADERS"),
-		CORSExposedHeaders:      envList("CHUNKGATE_CORS_EXPOSED_HEADERS"),
-		CORSAllowCredentials:    envBool("CHUNKGATE_CORS_ALLOW_CREDENTIALS", false),
-		CORSMaxAgeSeconds:       envInt("CHUNKGATE_CORS_MAX_AGE_SECONDS", defaultCORSMaxAge),
-		AuthAllowAnonymous:      envBool("CHUNKGATE_ALLOW_ANONYMOUS", defaultAuthAnon),
-		AuthCredentials:         credentialsFromEnv(),
+		ListenAddr:                 envString("CHUNKGATE_LISTEN", defaultListen),
+		DataDir:                    dataDir,
+		MetadataProvider:           envString("CHUNKGATE_METADATA", defaultMetadata),
+		MetadataDir:                envString("CHUNKGATE_METADATA_DIR", filepath.Join(dataDir, "metadata")),
+		BackendDir:                 envString("CHUNKGATE_BACKEND_DIR", filepath.Join(dataDir, "backend")),
+		ScratchDir:                 envString("CHUNKGATE_SCRATCH_DIR", filepath.Join(dataDir, "scratch")),
+		BackendProvider:            envString("CHUNKGATE_BACKEND", defaultBackend),
+		LocalBlockEncryptionKey:    envString("CHUNKGATE_LOCAL_BLOCK_ENCRYPTION_KEY", ""),
+		LocalCapacityBytes:         envInt64("CHUNKGATE_LOCAL_CAPACITY_BYTES", defaultLocalCap),
+		MaxConcurrentChunkers:      envInt("CHUNKGATE_MAX_CONCURRENT_CHUNKERS", defaultChunkWorkers),
+		CPUHeadroomCores:           envInt("CHUNKGATE_CPU_HEADROOM_CORES", defaultCPUHeadroom),
+		SmallFileThresholdBytes:    envInt("CHUNKGATE_SMALL_FILE_THRESHOLD_BYTES", defaultSmallBypass),
+		ChunkMinBytes:              envInt("CHUNKGATE_CHUNK_MIN_BYTES", defaultChunkMin),
+		ChunkAvgBytes:              envInt("CHUNKGATE_CHUNK_AVG_BYTES", defaultChunkAvg),
+		ChunkMaxBytes:              envInt("CHUNKGATE_CHUNK_MAX_BYTES", defaultChunkMax),
+		ChunkEngine:                envString("CHUNKGATE_CHUNK_ENGINE", defaultChunkEngine),
+		MultipartMaxPartBytes:      envInt64("CHUNKGATE_MULTIPART_MAX_PART_BYTES", defaultPartMax),
+		MultipartMaxUploadBytes:    envInt64("CHUNKGATE_MULTIPART_MAX_UPLOAD_BYTES", defaultLocalCap),
+		MultipartStaleTTL:          envDurationSeconds("CHUNKGATE_MULTIPART_STALE_TTL_SECONDS", defaultStaleTTL),
+		ScratchMinFreeBytes:        envInt64("CHUNKGATE_SCRATCH_MIN_FREE_BYTES", defaultScratchFree),
+		MaxObjectBytes:             envInt64("CHUNKGATE_MAX_OBJECT_BYTES", 0),
+		CompleteXMLMaxBytes:        envInt64("CHUNKGATE_COMPLETE_XML_MAX_BYTES", defaultCompleteXML),
+		S3Endpoint:                 envString("CHUNKGATE_S3_ENDPOINT", ""),
+		S3Provider:                 envString("CHUNKGATE_S3_PROVIDER", defaultS3Provider),
+		S3Region:                   envString("CHUNKGATE_S3_REGION", defaultS3Region),
+		S3Bucket:                   envString("CHUNKGATE_S3_BUCKET", ""),
+		S3AccessKey:                envString("CHUNKGATE_S3_ACCESS_KEY_ID", os.Getenv("AWS_ACCESS_KEY_ID")),
+		S3SecretKey:                envString("CHUNKGATE_S3_SECRET_ACCESS_KEY", os.Getenv("AWS_SECRET_ACCESS_KEY")),
+		S3SessionToken:             envString("CHUNKGATE_S3_SESSION_TOKEN", os.Getenv("AWS_SESSION_TOKEN")),
+		S3Prefix:                   envString("CHUNKGATE_S3_PREFIX", ""),
+		S3UseTLS:                   envBool("CHUNKGATE_S3_USE_TLS", defaultS3UseTLS),
+		S3PathStyle:                envBool("CHUNKGATE_S3_PATH_STYLE", defaultS3PathStyle),
+		S3Timeout:                  envDurationSeconds("CHUNKGATE_S3_TIMEOUT_SECONDS", defaultS3Timeout),
+		S3MaxRetries:               envInt("CHUNKGATE_S3_MAX_RETRIES", defaultS3Retries),
+		AzureAccountName:           envString("CHUNKGATE_AZURE_ACCOUNT_NAME", os.Getenv("AZURE_STORAGE_ACCOUNT")),
+		AzureAccountKey:            envString("CHUNKGATE_AZURE_ACCOUNT_KEY", os.Getenv("AZURE_STORAGE_KEY")),
+		AzureEndpoint:              envString("CHUNKGATE_AZURE_ENDPOINT", ""),
+		AzureContainer:             envString("CHUNKGATE_AZURE_CONTAINER", ""),
+		AzurePrefix:                envString("CHUNKGATE_AZURE_PREFIX", ""),
+		AzureAuth:                  envString("CHUNKGATE_AZURE_AUTH", defaultAzureAuth),
+		AzureTimeout:               envDurationSeconds("CHUNKGATE_AZURE_TIMEOUT_SECONDS", defaultAzureTimeout),
+		AzureMaxRetries:            envInt("CHUNKGATE_AZURE_MAX_RETRIES", defaultAzureRetries),
+		GCSProjectID:               envString("CHUNKGATE_GCS_PROJECT_ID", os.Getenv("GOOGLE_CLOUD_PROJECT")),
+		GCSBucket:                  envString("CHUNKGATE_GCS_BUCKET", ""),
+		GCSEndpoint:                envString("CHUNKGATE_GCS_ENDPOINT", os.Getenv("STORAGE_EMULATOR_HOST")),
+		GCSPrefix:                  envString("CHUNKGATE_GCS_PREFIX", ""),
+		GCSCredentialsFile:         envString("CHUNKGATE_GCS_CREDENTIALS_FILE", os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")),
+		GCSCredentialsJSON:         envString("CHUNKGATE_GCS_CREDENTIALS_JSON", ""),
+		GCSAuth:                    envString("CHUNKGATE_GCS_AUTH", defaultGCSAuth),
+		GCSTimeout:                 envDurationSeconds("CHUNKGATE_GCS_TIMEOUT_SECONDS", defaultGCSTimeout),
+		GCSMaxRetries:              envInt("CHUNKGATE_GCS_MAX_RETRIES", defaultGCSRetries),
+		SwiftAuthURL:               envString("CHUNKGATE_SWIFT_AUTH_URL", os.Getenv("OS_AUTH_URL")),
+		SwiftUsername:              envString("CHUNKGATE_SWIFT_USERNAME", os.Getenv("OS_USERNAME")),
+		SwiftUserID:                envString("CHUNKGATE_SWIFT_USER_ID", os.Getenv("OS_USER_ID")),
+		SwiftPassword:              envString("CHUNKGATE_SWIFT_PASSWORD", os.Getenv("OS_PASSWORD")),
+		SwiftApplicationCredID:     envString("CHUNKGATE_SWIFT_APPLICATION_CREDENTIAL_ID", os.Getenv("OS_APPLICATION_CREDENTIAL_ID")),
+		SwiftApplicationCredName:   envString("CHUNKGATE_SWIFT_APPLICATION_CREDENTIAL_NAME", os.Getenv("OS_APPLICATION_CREDENTIAL_NAME")),
+		SwiftApplicationCredSecret: envString("CHUNKGATE_SWIFT_APPLICATION_CREDENTIAL_SECRET", os.Getenv("OS_APPLICATION_CREDENTIAL_SECRET")),
+		SwiftProjectID:             envString("CHUNKGATE_SWIFT_PROJECT_ID", os.Getenv("OS_PROJECT_ID")),
+		SwiftProjectName:           envString("CHUNKGATE_SWIFT_PROJECT_NAME", os.Getenv("OS_PROJECT_NAME")),
+		SwiftDomainID:              envString("CHUNKGATE_SWIFT_DOMAIN_ID", os.Getenv("OS_USER_DOMAIN_ID")),
+		SwiftDomainName:            envString("CHUNKGATE_SWIFT_DOMAIN_NAME", os.Getenv("OS_USER_DOMAIN_NAME")),
+		SwiftRegion:                envString("CHUNKGATE_SWIFT_REGION", os.Getenv("OS_REGION_NAME")),
+		SwiftContainer:             envString("CHUNKGATE_SWIFT_CONTAINER", ""),
+		SwiftEndpoint:              envString("CHUNKGATE_SWIFT_ENDPOINT", ""),
+		SwiftPrefix:                envString("CHUNKGATE_SWIFT_PREFIX", ""),
+		SwiftAuth:                  envString("CHUNKGATE_SWIFT_AUTH", defaultSwiftAuth),
+		SwiftInsecureSkipVerify:    envBool("CHUNKGATE_SWIFT_INSECURE_SKIP_VERIFY", false),
+		SwiftTimeout:               envDurationSeconds("CHUNKGATE_SWIFT_TIMEOUT_SECONDS", defaultSwiftTimeout),
+		SwiftMaxRetries:            envInt("CHUNKGATE_SWIFT_MAX_RETRIES", defaultSwiftRetries),
+		GCEnabled:                  envBool("CHUNKGATE_GC_ENABLED", defaultGCEnabled),
+		GCInterval:                 envDurationSeconds("CHUNKGATE_GC_INTERVAL_SECONDS", defaultGCInterval),
+		GCMinOrphanAge:             envDurationSeconds("CHUNKGATE_GC_MIN_ORPHAN_AGE_SECONDS", defaultGCMinAge),
+		GCBatchSize:                envInt("CHUNKGATE_GC_BATCH_SIZE", defaultGCBatchSize),
+		GCMaxRetries:               envInt("CHUNKGATE_GC_MAX_RETRIES", defaultGCRetries),
+		PostgresDSN:                envString("CHUNKGATE_POSTGRES_DSN", ""),
+		PostgresMaxOpenConns:       envInt("CHUNKGATE_POSTGRES_MAX_OPEN_CONNS", defaultPGMaxOpen),
+		PostgresMaxIdleConns:       envInt("CHUNKGATE_POSTGRES_MAX_IDLE_CONNS", defaultPGMaxIdle),
+		PostgresConnMaxLifetime:    envDurationSeconds("CHUNKGATE_POSTGRES_CONN_MAX_LIFETIME_SECONDS", defaultPGLifetime),
+		ReadinessTimeout:           envDurationSeconds("CHUNKGATE_READINESS_TIMEOUT_SECONDS", defaultReadyTimeout),
+		ShutdownTimeout:            envDurationSeconds("CHUNKGATE_SHUTDOWN_TIMEOUT_SECONDS", defaultShutdown),
+		DebugPprofEnabled:          envBool("CHUNKGATE_DEBUG_PPROF_ENABLED", false),
+		VirtualHosts:               envList("CHUNKGATE_VIRTUAL_HOSTS"),
+		CORSAllowedOrigins:         envList("CHUNKGATE_CORS_ALLOWED_ORIGINS"),
+		CORSAllowedMethods:         envList("CHUNKGATE_CORS_ALLOWED_METHODS"),
+		CORSAllowedHeaders:         envList("CHUNKGATE_CORS_ALLOWED_HEADERS"),
+		CORSExposedHeaders:         envList("CHUNKGATE_CORS_EXPOSED_HEADERS"),
+		CORSAllowCredentials:       envBool("CHUNKGATE_CORS_ALLOW_CREDENTIALS", false),
+		CORSMaxAgeSeconds:          envInt("CHUNKGATE_CORS_MAX_AGE_SECONDS", defaultCORSMaxAge),
+		AuthAllowAnonymous:         envBool("CHUNKGATE_ALLOW_ANONYMOUS", defaultAuthAnon),
+		AuthCredentials:            credentialsFromEnv(),
 	}
 }
 
@@ -180,19 +264,11 @@ func (c Config) Validate() error {
 	if c.MetadataProvider == "postgres" && c.PostgresDSN == "" {
 		return fmt.Errorf("CHUNKGATE_POSTGRES_DSN is required when CHUNKGATE_METADATA=postgres")
 	}
-	if c.BackendDir == "" || c.ScratchDir == "" {
-		return fmt.Errorf("backend and scratch directories must be set")
+	if c.ScratchDir == "" {
+		return fmt.Errorf("CHUNKGATE_SCRATCH_DIR must be set")
 	}
-	if c.BackendProvider != "filesystem" && c.BackendProvider != "s3" {
-		return fmt.Errorf("CHUNKGATE_BACKEND must be filesystem or s3")
-	}
-	if c.LocalBlockEncryptionKey != "" && c.BackendProvider != "filesystem" {
-		return fmt.Errorf("CHUNKGATE_LOCAL_BLOCK_ENCRYPTION_KEY is only supported when CHUNKGATE_BACKEND=filesystem")
-	}
-	if c.LocalBlockEncryptionKey != "" {
-		if _, err := DecodeLocalBlockEncryptionKey(c.LocalBlockEncryptionKey); err != nil {
-			return err
-		}
+	if err := c.ValidateBackend(); err != nil {
+		return err
 	}
 	if c.LocalCapacityBytes < 0 {
 		return fmt.Errorf("CHUNKGATE_LOCAL_CAPACITY_BYTES must be >= 0")
@@ -238,23 +314,6 @@ func (c Config) Validate() error {
 	}
 	if c.CompleteXMLMaxBytes < 0 {
 		return fmt.Errorf("CHUNKGATE_COMPLETE_XML_MAX_BYTES must be >= 0")
-	}
-	if c.BackendProvider == "s3" {
-		if c.S3Endpoint == "" {
-			return fmt.Errorf("CHUNKGATE_S3_ENDPOINT is required when CHUNKGATE_BACKEND=s3")
-		}
-		if c.S3Bucket == "" {
-			return fmt.Errorf("CHUNKGATE_S3_BUCKET is required when CHUNKGATE_BACKEND=s3")
-		}
-		if (c.S3AccessKey == "") != (c.S3SecretKey == "") {
-			return fmt.Errorf("CHUNKGATE_S3_ACCESS_KEY_ID and CHUNKGATE_S3_SECRET_ACCESS_KEY must be set together")
-		}
-	}
-	if c.S3Timeout < 0 {
-		return fmt.Errorf("CHUNKGATE_S3_TIMEOUT_SECONDS must be >= 0")
-	}
-	if c.S3MaxRetries < 0 {
-		return fmt.Errorf("CHUNKGATE_S3_MAX_RETRIES must be >= 0")
 	}
 	if c.GCInterval < 0 {
 		return fmt.Errorf("CHUNKGATE_GC_INTERVAL_SECONDS must be >= 0")
@@ -308,6 +367,164 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (c Config) ValidateBackend() error {
+	switch c.BackendProvider {
+	case "filesystem":
+		if c.BackendDir == "" {
+			return fmt.Errorf("CHUNKGATE_BACKEND_DIR must be set when CHUNKGATE_BACKEND=filesystem")
+		}
+	case "s3":
+		if c.S3Endpoint == "" {
+			return fmt.Errorf("CHUNKGATE_S3_ENDPOINT is required when CHUNKGATE_BACKEND=s3")
+		}
+		if c.S3Bucket == "" {
+			return fmt.Errorf("CHUNKGATE_S3_BUCKET is required when CHUNKGATE_BACKEND=s3")
+		}
+	case "azure":
+		if c.AzureContainer == "" {
+			return fmt.Errorf("CHUNKGATE_AZURE_CONTAINER is required when CHUNKGATE_BACKEND=azure")
+		}
+		if c.AzureEndpoint == "" && c.AzureAccountName == "" {
+			return fmt.Errorf("CHUNKGATE_AZURE_ENDPOINT or CHUNKGATE_AZURE_ACCOUNT_NAME is required when CHUNKGATE_BACKEND=azure")
+		}
+	case "gcs":
+		if c.GCSBucket == "" {
+			return fmt.Errorf("CHUNKGATE_GCS_BUCKET is required when CHUNKGATE_BACKEND=gcs")
+		}
+	case "swift":
+		if c.SwiftContainer == "" {
+			return fmt.Errorf("CHUNKGATE_SWIFT_CONTAINER is required when CHUNKGATE_BACKEND=swift")
+		}
+		if c.SwiftAuthURL == "" {
+			return fmt.Errorf("CHUNKGATE_SWIFT_AUTH_URL is required when CHUNKGATE_BACKEND=swift")
+		}
+	default:
+		return fmt.Errorf("CHUNKGATE_BACKEND must be filesystem, s3, azure, gcs, or swift")
+	}
+	if c.LocalBlockEncryptionKey != "" && c.BackendProvider != "filesystem" {
+		return fmt.Errorf("CHUNKGATE_LOCAL_BLOCK_ENCRYPTION_KEY is only supported when CHUNKGATE_BACKEND=filesystem")
+	}
+	if c.LocalBlockEncryptionKey != "" {
+		if _, err := DecodeLocalBlockEncryptionKey(c.LocalBlockEncryptionKey); err != nil {
+			return err
+		}
+	}
+	if (c.S3AccessKey == "") != (c.S3SecretKey == "") {
+		return fmt.Errorf("CHUNKGATE_S3_ACCESS_KEY_ID and CHUNKGATE_S3_SECRET_ACCESS_KEY must be set together")
+	}
+	if !validS3Provider(c.S3Provider) {
+		return fmt.Errorf("CHUNKGATE_S3_PROVIDER must be generic, aws, minio, r2, supabase, or b2")
+	}
+	if c.S3Timeout < 0 {
+		return fmt.Errorf("CHUNKGATE_S3_TIMEOUT_SECONDS must be >= 0")
+	}
+	if c.S3MaxRetries < 0 {
+		return fmt.Errorf("CHUNKGATE_S3_MAX_RETRIES must be >= 0")
+	}
+	if !validAzureAuth(c.AzureAuth) {
+		return fmt.Errorf("CHUNKGATE_AZURE_AUTH must be auto, shared-key, or default")
+	}
+	if strings.EqualFold(strings.TrimSpace(c.AzureAuth), "shared-key") && (c.AzureAccountName == "" || c.AzureAccountKey == "") {
+		return fmt.Errorf("CHUNKGATE_AZURE_ACCOUNT_NAME and CHUNKGATE_AZURE_ACCOUNT_KEY are required when CHUNKGATE_AZURE_AUTH=shared-key")
+	}
+	if c.AzureAccountKey != "" && c.AzureAccountName == "" {
+		return fmt.Errorf("CHUNKGATE_AZURE_ACCOUNT_NAME is required when CHUNKGATE_AZURE_ACCOUNT_KEY is set")
+	}
+	if c.AzureTimeout < 0 {
+		return fmt.Errorf("CHUNKGATE_AZURE_TIMEOUT_SECONDS must be >= 0")
+	}
+	if c.AzureMaxRetries < 0 {
+		return fmt.Errorf("CHUNKGATE_AZURE_MAX_RETRIES must be >= 0")
+	}
+	if !validGCSAuth(c.GCSAuth) {
+		return fmt.Errorf("CHUNKGATE_GCS_AUTH must be auto, service-account, default, or emulator")
+	}
+	if c.GCSCredentialsFile != "" && c.GCSCredentialsJSON != "" {
+		return fmt.Errorf("CHUNKGATE_GCS_CREDENTIALS_FILE and CHUNKGATE_GCS_CREDENTIALS_JSON are mutually exclusive")
+	}
+	if strings.EqualFold(strings.TrimSpace(c.GCSAuth), "service-account") && c.GCSCredentialsFile == "" && c.GCSCredentialsJSON == "" {
+		return fmt.Errorf("CHUNKGATE_GCS_CREDENTIALS_FILE or CHUNKGATE_GCS_CREDENTIALS_JSON is required when CHUNKGATE_GCS_AUTH=service-account")
+	}
+	if c.GCSTimeout < 0 {
+		return fmt.Errorf("CHUNKGATE_GCS_TIMEOUT_SECONDS must be >= 0")
+	}
+	if c.GCSMaxRetries < 0 {
+		return fmt.Errorf("CHUNKGATE_GCS_MAX_RETRIES must be >= 0")
+	}
+	if !validSwiftAuth(c.SwiftAuth) {
+		return fmt.Errorf("CHUNKGATE_SWIFT_AUTH must be auto, password, or application-credential")
+	}
+	if c.BackendProvider == "swift" {
+		swiftAuth := strings.ToLower(strings.TrimSpace(c.SwiftAuth))
+		if swiftAuth == "" || swiftAuth == "auto" {
+			if c.SwiftApplicationCredID != "" || c.SwiftApplicationCredName != "" || c.SwiftApplicationCredSecret != "" {
+				swiftAuth = "application-credential"
+			} else {
+				swiftAuth = "password"
+			}
+		}
+		if swiftAuth == "password" {
+			if c.SwiftUsername == "" && c.SwiftUserID == "" {
+				return fmt.Errorf("CHUNKGATE_SWIFT_USERNAME or CHUNKGATE_SWIFT_USER_ID is required for Swift password auth")
+			}
+			if c.SwiftPassword == "" {
+				return fmt.Errorf("CHUNKGATE_SWIFT_PASSWORD is required for Swift password auth")
+			}
+		}
+		if swiftAuth == "application-credential" {
+			if c.SwiftApplicationCredID == "" && c.SwiftApplicationCredName == "" {
+				return fmt.Errorf("CHUNKGATE_SWIFT_APPLICATION_CREDENTIAL_ID or CHUNKGATE_SWIFT_APPLICATION_CREDENTIAL_NAME is required for Swift application-credential auth")
+			}
+			if c.SwiftApplicationCredSecret == "" {
+				return fmt.Errorf("CHUNKGATE_SWIFT_APPLICATION_CREDENTIAL_SECRET is required for Swift application-credential auth")
+			}
+		}
+	}
+	if c.SwiftTimeout < 0 {
+		return fmt.Errorf("CHUNKGATE_SWIFT_TIMEOUT_SECONDS must be >= 0")
+	}
+	if c.SwiftMaxRetries < 0 {
+		return fmt.Errorf("CHUNKGATE_SWIFT_MAX_RETRIES must be >= 0")
+	}
+	return nil
+}
+
+func validS3Provider(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "", "generic", "aws", "aws-s3", "minio", "r2", "cloudflare-r2", "supabase", "b2", "backblaze-b2":
+		return true
+	default:
+		return false
+	}
+}
+
+func validAzureAuth(auth string) bool {
+	switch strings.ToLower(strings.TrimSpace(auth)) {
+	case "", "auto", "shared-key", "default":
+		return true
+	default:
+		return false
+	}
+}
+
+func validGCSAuth(auth string) bool {
+	switch strings.ToLower(strings.TrimSpace(auth)) {
+	case "", "auto", "service-account", "default", "emulator":
+		return true
+	default:
+		return false
+	}
+}
+
+func validSwiftAuth(auth string) bool {
+	switch strings.ToLower(strings.TrimSpace(auth)) {
+	case "", "auto", "password", "application-credential":
+		return true
+	default:
+		return false
+	}
 }
 
 func envString(key, fallback string) string {

@@ -971,6 +971,10 @@ func (b *deltaCountingBackend) HasBlock(ctx context.Context, tenant string, hash
 	return b.inner.HasBlock(ctx, tenant, hash)
 }
 
+func (b *deltaCountingBackend) HealthCheck(ctx context.Context) error {
+	return b.inner.HealthCheck(ctx)
+}
+
 func deltaPayload() string {
 	var b strings.Builder
 	for i := 0; i < 256; i++ {

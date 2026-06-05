@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/chunkgate/chunkgate/internal/api"
-	"github.com/chunkgate/chunkgate/internal/backend"
+	backendfactory "github.com/chunkgate/chunkgate/internal/backend/factory"
 	"github.com/chunkgate/chunkgate/internal/chunker"
 	"github.com/chunkgate/chunkgate/internal/config"
 	"github.com/chunkgate/chunkgate/internal/gc"
@@ -45,7 +45,7 @@ func main() {
 	}
 	defer store.Close()
 
-	blocks, err := newBlockStore(cfg)
+	blocks, err := backendfactory.New(cfg)
 	if err != nil {
 		logger.Error("configure_backend_failed", "error", err)
 		os.Exit(1)
@@ -200,35 +200,5 @@ func newMetadataStore(ctx context.Context, cfg config.Config) (metadata.Store, e
 		})
 	default:
 		return nil, errors.New("unsupported metadata provider")
-	}
-}
-
-func newBlockStore(cfg config.Config) (backend.BlockStore, error) {
-	switch cfg.BackendProvider {
-	case "filesystem":
-		if cfg.LocalBlockEncryptionKey != "" {
-			key, err := config.DecodeLocalBlockEncryptionKey(cfg.LocalBlockEncryptionKey)
-			if err != nil {
-				return nil, err
-			}
-			return backend.NewEncryptedFileStore(cfg.BackendDir, key)
-		}
-		return backend.NewFileStore(cfg.BackendDir), nil
-	case "s3":
-		return backend.NewS3Store(backend.S3Options{
-			Endpoint:     cfg.S3Endpoint,
-			Region:       cfg.S3Region,
-			Bucket:       cfg.S3Bucket,
-			AccessKey:    cfg.S3AccessKey,
-			SecretKey:    cfg.S3SecretKey,
-			SessionToken: cfg.S3SessionToken,
-			Prefix:       cfg.S3Prefix,
-			Secure:       cfg.S3UseTLS,
-			PathStyle:    cfg.S3PathStyle,
-			Timeout:      cfg.S3Timeout,
-			MaxRetries:   cfg.S3MaxRetries,
-		})
-	default:
-		return nil, errors.New("unsupported backend provider")
 	}
 }

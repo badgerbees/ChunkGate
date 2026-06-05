@@ -17,11 +17,19 @@ import (
 )
 
 const (
-	defaultS3Timeout = 30 * time.Second
+	defaultS3Timeout            = 30 * time.Second
+	defaultS3DeleteObjectsLimit = 1000
+	S3ProviderGeneric           = "generic"
+	S3ProviderAWS               = "aws"
+	S3ProviderMinIO             = "minio"
+	S3ProviderR2                = "r2"
+	S3ProviderSupabase          = "supabase"
+	S3ProviderB2                = "b2"
 )
 
 type S3Options struct {
 	Endpoint     string
+	Provider     string
 	Region       string
 	Bucket       string
 	AccessKey    string
@@ -35,11 +43,13 @@ type S3Options struct {
 }
 
 type S3Store struct {
-	client     s3ObjectClient
-	bucket     string
-	prefix     string
-	timeout    time.Duration
-	maxRetries int
+	client          s3ObjectClient
+	provider        string
+	bucket          string
+	prefix          string
+	timeout         time.Duration
+	maxRetries      int
+	deleteBatchSize int
 }
 
 type s3ObjectClient interface {
@@ -68,6 +78,8 @@ func NewS3Store(options S3Options) (*S3Store, error) {
 	if timeout == 0 {
 		timeout = defaultS3Timeout
 	}
+	provider := NormalizeS3Provider(options.Provider)
+	quirks := s3ProviderQuirks(provider)
 
 	bucketLookup := minio.BucketLookupDNS
 	if options.PathStyle {
@@ -98,11 +110,13 @@ func NewS3Store(options S3Options) (*S3Store, error) {
 	}
 
 	return &S3Store{
-		client:     client,
-		bucket:     options.Bucket,
-		prefix:     cleanS3Prefix(options.Prefix),
-		timeout:    timeout,
-		maxRetries: options.MaxRetries,
+		client:          client,
+		provider:        provider,
+		bucket:          options.Bucket,
+		prefix:          cleanS3Prefix(options.Prefix),
+		timeout:         timeout,
+		maxRetries:      options.MaxRetries,
+		deleteBatchSize: quirks.DeleteObjectsLimit,
 	}, nil
 }
 
@@ -147,13 +161,8 @@ func (s *S3Store) GetBlock(ctx context.Context, tenant string, hash string) (io.
 		if !retryableS3Error(ctx, err) || attempt == attempts-1 {
 			break
 		}
-		delay := time.Duration(100*(1<<attempt)) * time.Millisecond
-		timer := time.NewTimer(delay)
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, ctx.Err()
+		if err := waitRetryDelay(ctx, defaultRetryBaseDelay, attempt); err != nil {
+			return nil, err
 		}
 	}
 	return nil, wrapS3Error("get block", key, last)
@@ -189,10 +198,24 @@ func (s *S3Store) DeleteBlocks(ctx context.Context, tenant string, hashes []stri
 		keys = append(keys, key)
 	}
 
-	err := s.withRetry(ctx, func(ctx context.Context) error {
-		return s.client.DeleteObjects(ctx, s.bucket, keys)
-	})
-	return wrapS3Error("delete blocks", tenant, err)
+	limit := s.deleteBatchSize
+	if limit <= 0 {
+		limit = defaultS3DeleteObjectsLimit
+	}
+	for start := 0; start < len(keys); start += limit {
+		end := start + limit
+		if end > len(keys) {
+			end = len(keys)
+		}
+		batch := keys[start:end]
+		err := s.withRetry(ctx, func(ctx context.Context) error {
+			return s.client.DeleteObjects(ctx, s.bucket, batch)
+		})
+		if err != nil {
+			return wrapS3Error("delete blocks", tenant, err)
+		}
+	}
+	return nil
 }
 
 func (s *S3Store) HealthCheck(ctx context.Context) error {
@@ -217,37 +240,12 @@ func (s *S3Store) blockKey(tenant string, hash string) (string, error) {
 }
 
 func (s *S3Store) withRetry(ctx context.Context, operation func(context.Context) error) error {
-	attempts := s.maxRetries + 1
-	if attempts < 1 {
-		attempts = 1
-	}
-	var last error
-	for attempt := 0; attempt < attempts; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		attemptCtx := ctx
-		var cancel context.CancelFunc
-		if s.timeout > 0 {
-			attemptCtx, cancel = context.WithTimeout(ctx, s.timeout)
-		}
-		last = operation(attemptCtx)
-		if cancel != nil {
-			cancel()
-		}
-		if last == nil || !retryableS3Error(ctx, last) || attempt == attempts-1 {
-			return last
-		}
-		delay := time.Duration(100*(1<<attempt)) * time.Millisecond
-		timer := time.NewTimer(delay)
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		}
-	}
-	return last
+	return DoWithRetry(ctx, RetryOptions{
+		Timeout:    s.timeout,
+		MaxRetries: s.maxRetries,
+	}, func(err error) bool {
+		return retryableS3Error(ctx, err)
+	}, operation)
 }
 
 type minioS3Client struct {
@@ -369,6 +367,38 @@ func cleanS3Prefix(prefix string) string {
 		return ""
 	}
 	return prefix + "/"
+}
+
+type s3Quirks struct {
+	DeleteObjectsLimit int
+}
+
+func NormalizeS3Provider(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "", S3ProviderGeneric:
+		return S3ProviderGeneric
+	case S3ProviderAWS, "aws-s3":
+		return S3ProviderAWS
+	case S3ProviderMinIO:
+		return S3ProviderMinIO
+	case S3ProviderR2, "cloudflare-r2":
+		return S3ProviderR2
+	case S3ProviderSupabase:
+		return S3ProviderSupabase
+	case S3ProviderB2, "backblaze-b2":
+		return S3ProviderB2
+	default:
+		return S3ProviderGeneric
+	}
+}
+
+func s3ProviderQuirks(provider string) s3Quirks {
+	switch NormalizeS3Provider(provider) {
+	case S3ProviderAWS, S3ProviderMinIO, S3ProviderR2, S3ProviderSupabase, S3ProviderB2:
+		return s3Quirks{DeleteObjectsLimit: defaultS3DeleteObjectsLimit}
+	default:
+		return s3Quirks{DeleteObjectsLimit: defaultS3DeleteObjectsLimit}
+	}
 }
 
 func wrapS3Error(operation string, key string, err error) error {

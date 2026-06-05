@@ -14,5 +14,7 @@ var (
 type BlockStore interface {
 	PutBlock(ctx context.Context, tenant string, hash string, data []byte) error
 	GetBlock(ctx context.Context, tenant string, hash string) (io.ReadCloser, error)
+	HasBlock(ctx context.Context, tenant string, hash string) (bool, error)
 	DeleteBlocks(ctx context.Context, tenant string, hashes []string) error
+	HealthCheck(ctx context.Context) error
 }

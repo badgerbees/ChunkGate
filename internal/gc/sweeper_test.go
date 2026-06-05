@@ -196,6 +196,17 @@ func (b *recordingBackend) DeleteBlocks(ctx context.Context, tenant string, hash
 	return nil
 }
 
+func (b *recordingBackend) HasBlock(ctx context.Context, tenant string, hash string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (b *recordingBackend) HealthCheck(ctx context.Context) error {
+	return ctx.Err()
+}
+
 func (b *recordingBackend) callSizes() []int {
 	b.mu.Lock()
 	defer b.mu.Unlock()

@@ -11,6 +11,24 @@ import (
 
 const testBlockHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
+func TestFileStoreBlockStoreContract(t *testing.T) {
+	RunBlockStoreContract(t, func(t *testing.T) BlockStore {
+		t.Helper()
+		return NewFileStore(t.TempDir())
+	})
+}
+
+func TestEncryptedFileStoreBlockStoreContract(t *testing.T) {
+	RunBlockStoreContract(t, func(t *testing.T) BlockStore {
+		t.Helper()
+		store, err := NewEncryptedFileStore(t.TempDir(), []byte("0123456789abcdef0123456789abcdef"))
+		if err != nil {
+			t.Fatalf("create encrypted store failed: %v", err)
+		}
+		return store
+	})
+}
+
 func TestFileStorePutGetDeleteBlock(t *testing.T) {
 	store := NewFileStore(t.TempDir())
 	ctx := context.Background()
