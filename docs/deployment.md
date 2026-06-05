@@ -27,6 +27,19 @@ If your client uses virtual-hosted-style buckets, set `CHUNKGATE_VIRTUAL_HOSTS` 
 
 ## Docker
 
+Published images are available from GitHub Container Registry:
+
+```sh
+docker pull ghcr.io/badgerbees/chunkgate:edge
+docker run --rm -p 8080:8080 \
+  -v chunkgate-data:/data \
+  -e CHUNKGATE_ACCESS_KEY_ID=tenant-a \
+  -e CHUNKGATE_SECRET_ACCESS_KEY=dev-secret \
+  ghcr.io/badgerbees/chunkgate:edge
+```
+
+The `edge` tag tracks the default branch. Version tags such as `v1.0.0` publish `1.0.0`, `1.0`, `1`, and `latest`.
+
 Build the image locally:
 
 ```sh
