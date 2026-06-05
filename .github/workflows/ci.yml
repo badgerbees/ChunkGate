@@ -52,3 +52,4 @@ jobs:
           CHUNKGATE_POSTGRES_TEST_DSN: postgres://chunkgate:chunkgate@localhost:5432/chunkgate?sslmode=disable
       - run: go vet ./...
       - run: go build -o /tmp/chunkgate ./cmd/chunkgate
+      - run: go build -o /tmp/chunkgate-delta ./cmd/chunkgate-delta

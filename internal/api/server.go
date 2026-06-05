@@ -172,6 +172,10 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, deltaAPIPrefix) {
+		s.deltaRoute(w, r, identity.Tenant)
+		return
+	}
 
 	target, ok := parseS3Path(r.URL.EscapedPath())
 	if !ok {

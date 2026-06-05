@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"net/http"
@@ -18,6 +19,12 @@ func writeXML(w http.ResponseWriter, status int, value any) {
 	w.WriteHeader(status)
 	_, _ = w.Write([]byte(xml.Header))
 	_ = xml.NewEncoder(w).Encode(value)
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
 }
 
 func writeError(w http.ResponseWriter, status int, code string, message string) {

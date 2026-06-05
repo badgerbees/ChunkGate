@@ -24,6 +24,8 @@ This repository currently contains the deployable base architecture:
 - Structured JSON request logging.
 - Background soft-delete GC with orphan-age protection, provider-sized bulk deletes, retries, and metrics.
 - Health, readiness, Prometheus metrics, and optional gated pprof debug endpoints.
+- Versioned companion manifest/chunk API for ChunkGate-aware delta downloads.
+- Proof-of-concept `chunkgate-delta` client with a local verified block cache.
 - Pluggable block backends: local filesystem by default, or S3-compatible storage for AWS S3, MinIO, Cloudflare R2, and similar providers.
 
 ## Run Locally
@@ -153,6 +155,7 @@ go run ./cmd/chunkgate
 go test ./...
 go vet ./...
 go build -o chunkgate ./cmd/chunkgate
+go build -o chunkgate-delta ./cmd/chunkgate-delta
 go test ./internal/chunker -bench . -benchmem
 ```
 
@@ -179,5 +182,7 @@ Operational endpoints:
 ## Storage Layers
 
 The core object service depends on `backend.BlockStore`, so filesystem and S3-compatible block storage share the same code path. The metadata layer depends on `metadata.Store`, so SQLite and PostgreSQL can be selected without changing the API, object, chunking, multipart, or GC layers.
+
+ChunkGate-aware clients can use the manifest-first delta protocol documented in [docs/delta-protocol.md](docs/delta-protocol.md). Ordinary S3 clients continue to use full-object `GET`, `HEAD`, and range reads.
 
 Security assumptions and remaining risks are documented in [docs/threat-model.md](docs/threat-model.md).

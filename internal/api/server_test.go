@@ -2,9 +2,12 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/xml"
 	"io"
 	"net/http"
@@ -19,6 +22,7 @@ import (
 
 	"github.com/chunkgate/chunkgate/internal/backend"
 	"github.com/chunkgate/chunkgate/internal/chunker"
+	"github.com/chunkgate/chunkgate/internal/deltaclient"
 	"github.com/chunkgate/chunkgate/internal/gc"
 	"github.com/chunkgate/chunkgate/internal/limits"
 	"github.com/chunkgate/chunkgate/internal/metadata"
@@ -483,6 +487,208 @@ func TestServerRejectsInvalidMultipartUploadIDsAndPartNumbers(t *testing.T) {
 	}
 }
 
+func TestDeltaManifestAndChunkEndpoints(t *testing.T) {
+	server := testServer(t)
+	payload := deltaPayload()
+	put := httptest.NewRequest(http.MethodPut, "/bucket/delta.bin", strings.NewReader(payload))
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, put)
+	if w.Code != http.StatusOK {
+		t.Fatalf("put status = %d body = %s", w.Code, w.Body.String())
+	}
+
+	manifestReq := httptest.NewRequest(http.MethodGet, "/_chunkgate/v1/manifest?bucket=bucket&key=delta.bin", nil)
+	w = httptest.NewRecorder()
+	server.ServeHTTP(w, manifestReq)
+	if w.Code != http.StatusOK {
+		t.Fatalf("manifest status = %d body = %s", w.Code, w.Body.String())
+	}
+	var manifest deltaManifestResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &manifest); err != nil {
+		t.Fatalf("decode manifest failed: %v", err)
+	}
+	if manifest.Version != 1 || manifest.Bucket != "bucket" || manifest.Key != "delta.bin" || manifest.Size != int64(len(payload)) {
+		t.Fatalf("manifest = %#v", manifest)
+	}
+	if len(manifest.Chunks) < 2 {
+		t.Fatalf("expected multiple chunks, got %#v", manifest.Chunks)
+	}
+	if manifest.ObjectMD5 == "" {
+		t.Fatalf("manifest object md5 is empty: %#v", manifest)
+	}
+
+	first := manifest.Chunks[0]
+	chunkReqBody := bytes.NewBufferString(`{"bucket":"bucket","key":"delta.bin","hashes":["` + first.Hash + `"]}`)
+	chunkReq := httptest.NewRequest(http.MethodPost, "/_chunkgate/v1/chunks", chunkReqBody)
+	chunkReq.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	server.ServeHTTP(w, chunkReq)
+	if w.Code != http.StatusOK {
+		t.Fatalf("chunks status = %d body = %s", w.Code, w.Body.String())
+	}
+	var chunks deltaChunkResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &chunks); err != nil {
+		t.Fatalf("decode chunks failed: %v", err)
+	}
+	if len(chunks.Chunks) != 1 || chunks.Chunks[0].Hash != first.Hash || chunks.Chunks[0].Size != first.Size {
+		t.Fatalf("chunks = %#v", chunks)
+	}
+	data, err := base64.StdEncoding.DecodeString(chunks.Chunks[0].Data)
+	if err != nil {
+		t.Fatalf("decode chunk data failed: %v", err)
+	}
+	if got := testSHA256Hex(data); got != first.Hash {
+		t.Fatalf("chunk hash = %s, want %s", got, first.Hash)
+	}
+
+	ordinary := httptest.NewRequest(http.MethodGet, "/bucket/delta.bin", nil)
+	w = httptest.NewRecorder()
+	server.ServeHTTP(w, ordinary)
+	if w.Code != http.StatusOK || w.Body.String() != payload {
+		t.Fatalf("ordinary get status = %d body len = %d", w.Code, w.Body.Len())
+	}
+}
+
+func TestDeltaChunkEndpointRejectsChunksOutsideManifest(t *testing.T) {
+	server := testServer(t)
+	put := httptest.NewRequest(http.MethodPut, "/bucket/delta.bin", strings.NewReader(deltaPayload()))
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, put)
+	if w.Code != http.StatusOK {
+		t.Fatalf("put status = %d body = %s", w.Code, w.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/_chunkgate/v1/chunks", strings.NewReader(`{"bucket":"bucket","key":"delta.bin","hashes":["ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"]}`))
+	w = httptest.NewRecorder()
+	server.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "<Code>InvalidChunk</Code>") {
+		t.Fatalf("body = %s, want InvalidChunk", w.Body.String())
+	}
+}
+
+func TestDeltaEndpointsRequireAuthenticationUnlessAnonymousTenantIsConfigured(t *testing.T) {
+	server := testServer(t, withoutAnonymousTenant())
+
+	req := httptest.NewRequest(http.MethodGet, "/_chunkgate/v1/manifest?bucket=bucket&key=delta.bin", nil)
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "<Code>AccessDenied</Code>") {
+		t.Fatalf("body = %s, want AccessDenied", w.Body.String())
+	}
+}
+
+func TestDeltaClientDownloadsOnlyMissingChunksAndS3GetStillWorks(t *testing.T) {
+	blocks := &deltaCountingBackend{inner: backend.NewFileStore(t.TempDir())}
+	server := testServer(t, withBackend(blocks))
+	payload := deltaPayload()
+
+	put := httptest.NewRequest(http.MethodPut, "/bucket/delta-client.bin", strings.NewReader(payload))
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, put)
+	if w.Code != http.StatusOK {
+		t.Fatalf("put status = %d body = %s", w.Code, w.Body.String())
+	}
+
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+	client := deltaclient.Client{Endpoint: httpServer.URL}
+	ctx := context.Background()
+	manifest, err := client.FetchManifest(ctx, "bucket", "delta-client.bin")
+	if err != nil {
+		t.Fatalf("fetch manifest failed: %v", err)
+	}
+	uniqueHashes := uniqueManifestHashes(manifest.Chunks)
+	if len(uniqueHashes) < 2 {
+		t.Fatalf("expected multiple unique chunks, got %#v", manifest.Chunks)
+	}
+
+	cache := deltaclient.Cache{Dir: t.TempDir()}
+	reader, err := blocks.inner.GetBlock(ctx, "default", uniqueHashes[0])
+	if err != nil {
+		t.Fatalf("read seed block failed: %v", err)
+	}
+	seed, err := io.ReadAll(reader)
+	reader.Close()
+	if err != nil {
+		t.Fatalf("read seed block failed: %v", err)
+	}
+	if err := cache.Put(uniqueHashes[0], seed); err != nil {
+		t.Fatalf("seed cache failed: %v", err)
+	}
+
+	blocks.opened = nil
+	output := t.TempDir() + "/delta-client.bin"
+	result, err := client.Download(ctx, "bucket", "delta-client.bin", output, cache.Dir)
+	if err != nil {
+		t.Fatalf("delta download failed: %v", err)
+	}
+	if result.MissingChunks != len(uniqueHashes)-1 {
+		t.Fatalf("missing chunks = %d, want %d", result.MissingChunks, len(uniqueHashes)-1)
+	}
+	if len(blocks.opened) != len(uniqueHashes)-1 {
+		t.Fatalf("backend opened chunks = %#v, want %d missing chunks", blocks.opened, len(uniqueHashes)-1)
+	}
+	downloaded, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatalf("read output failed: %v", err)
+	}
+	if string(downloaded) != payload {
+		t.Fatalf("downloaded payload = %q", string(downloaded))
+	}
+
+	resp, err := http.Get(httpServer.URL + "/bucket/delta-client.bin")
+	if err != nil {
+		t.Fatalf("ordinary get failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read ordinary get failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK || string(body) != payload {
+		t.Fatalf("ordinary get status = %d body len = %d", resp.StatusCode, len(body))
+	}
+}
+
+func TestDeltaClientSignsCompanionRequests(t *testing.T) {
+	now := time.Now().UTC()
+	server := testServer(t, withTestAuth(t, now, s3auth.Credential{AccessKey: "tenant-a", SecretKey: "secret-a"}))
+	payload := deltaPayload()
+
+	put := httptest.NewRequest(http.MethodPut, "/bucket/signed-delta.bin", strings.NewReader(payload))
+	signRequest(t, put, "tenant-a", "secret-a", now)
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, put)
+	if w.Code != http.StatusOK {
+		t.Fatalf("signed put status = %d body = %s", w.Code, w.Body.String())
+	}
+
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+	client := deltaclient.Client{
+		Endpoint:  httpServer.URL,
+		AccessKey: "tenant-a",
+		SecretKey: "secret-a",
+	}
+	output := t.TempDir() + "/signed-delta.bin"
+	if _, err := client.Download(context.Background(), "bucket", "signed-delta.bin", output, t.TempDir()); err != nil {
+		t.Fatalf("signed delta download failed: %v", err)
+	}
+	downloaded, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatalf("read signed output failed: %v", err)
+	}
+	if string(downloaded) != payload {
+		t.Fatalf("downloaded payload = %q", string(downloaded))
+	}
+}
+
 func TestWriteInternalErrorMapsBackendErrors(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -647,6 +853,50 @@ func TestServerExposesOperationalMetrics(t *testing.T) {
 			t.Fatalf("metrics body = %s, want %s", w.Body.String(), want)
 		}
 	}
+}
+
+type deltaCountingBackend struct {
+	inner  *backend.FileStore
+	opened []string
+}
+
+func (b *deltaCountingBackend) PutBlock(ctx context.Context, tenant string, hash string, data []byte) error {
+	return b.inner.PutBlock(ctx, tenant, hash, data)
+}
+
+func (b *deltaCountingBackend) GetBlock(ctx context.Context, tenant string, hash string) (io.ReadCloser, error) {
+	b.opened = append(b.opened, hash)
+	return b.inner.GetBlock(ctx, tenant, hash)
+}
+
+func (b *deltaCountingBackend) DeleteBlocks(ctx context.Context, tenant string, hashes []string) error {
+	return b.inner.DeleteBlocks(ctx, tenant, hashes)
+}
+
+func (b *deltaCountingBackend) HasBlock(ctx context.Context, tenant string, hash string) (bool, error) {
+	return b.inner.HasBlock(ctx, tenant, hash)
+}
+
+func deltaPayload() string {
+	var b strings.Builder
+	for i := 0; i < 256; i++ {
+		b.WriteString(strconvItoa(i))
+		b.WriteString(":chunkgate-delta-protocol;")
+	}
+	return b.String()
+}
+
+func uniqueManifestHashes(chunks []deltaclient.ManifestChunk) []string {
+	seen := map[string]bool{}
+	hashes := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		if seen[chunk.Hash] {
+			continue
+		}
+		seen[chunk.Hash] = true
+		hashes = append(hashes, chunk.Hash)
+	}
+	return hashes
 }
 
 type serverOption func(*serverTestConfig)

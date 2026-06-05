@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 
@@ -15,6 +16,8 @@ import (
 	"github.com/chunkgate/chunkgate/internal/metadata"
 	"github.com/chunkgate/chunkgate/internal/ops"
 )
+
+var ErrChunkNotInManifest = errors.New("chunk is not part of object manifest")
 
 type Config struct {
 	Chunker *chunker.Splitter
@@ -35,6 +38,12 @@ type Service struct {
 type ByteRange struct {
 	Start int64
 	End   int64
+}
+
+type SelectedChunk struct {
+	Hash string
+	Size int64
+	Data []byte
 }
 
 type PutOptions struct {
@@ -170,6 +179,61 @@ func (s *Service) OpenRange(ctx context.Context, tenant string, bucket string, k
 
 func (s *Service) Stat(ctx context.Context, tenant string, bucket string, key string) (metadata.ObjectManifest, error) {
 	return s.store.GetObject(ctx, tenant, bucket, key)
+}
+
+func (s *Service) ReadChunks(ctx context.Context, tenant string, bucket string, key string, hashes []string) (metadata.ObjectManifest, []SelectedChunk, error) {
+	manifest, err := s.store.GetObject(ctx, tenant, bucket, key)
+	if err != nil {
+		return metadata.ObjectManifest{}, nil, err
+	}
+	if len(hashes) == 0 {
+		return manifest, nil, nil
+	}
+
+	manifestChunks := make(map[string]metadata.ChunkRef, len(manifest.Chunks))
+	for _, chunk := range manifest.Chunks {
+		if _, exists := manifestChunks[chunk.Hash]; !exists {
+			manifestChunks[chunk.Hash] = chunk
+		}
+	}
+
+	seen := map[string]bool{}
+	selected := make([]SelectedChunk, 0, len(hashes))
+	for _, hash := range hashes {
+		if seen[hash] {
+			continue
+		}
+		seen[hash] = true
+		chunk, ok := manifestChunks[hash]
+		if !ok {
+			return metadata.ObjectManifest{}, nil, ErrChunkNotInManifest
+		}
+		reader, err := s.backend.GetBlock(ctx, tenant, hash)
+		if err != nil {
+			return metadata.ObjectManifest{}, nil, err
+		}
+		data, readErr := io.ReadAll(reader)
+		closeErr := reader.Close()
+		if readErr != nil {
+			return metadata.ObjectManifest{}, nil, fmt.Errorf("read chunk %s: %w", hash, readErr)
+		}
+		if closeErr != nil {
+			return metadata.ObjectManifest{}, nil, closeErr
+		}
+		if int64(len(data)) != chunk.Size {
+			return metadata.ObjectManifest{}, nil, fmt.Errorf("chunk %s size mismatch", hash)
+		}
+		sum := sha256.Sum256(data)
+		if hex.EncodeToString(sum[:]) != hash {
+			return metadata.ObjectManifest{}, nil, fmt.Errorf("chunk %s hash mismatch", hash)
+		}
+		selected = append(selected, SelectedChunk{
+			Hash: hash,
+			Size: chunk.Size,
+			Data: data,
+		})
+	}
+	return manifest, selected, nil
 }
 
 func (s *Service) openChunks(ctx context.Context, tenant string, manifest metadata.ObjectManifest, byteRange *ByteRange) (io.ReadCloser, error) {

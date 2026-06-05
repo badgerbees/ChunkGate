@@ -4,7 +4,8 @@ WORKDIR /src
 COPY go.mod go.sum* ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/chunkgate ./cmd/chunkgate
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/chunkgate ./cmd/chunkgate && \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/chunkgate-delta ./cmd/chunkgate-delta
 
 FROM alpine:3.20
 
@@ -13,6 +14,7 @@ RUN apk add --no-cache ca-certificates su-exec
 
 WORKDIR /app
 COPY --from=build /out/chunkgate /usr/local/bin/chunkgate
+COPY --from=build /out/chunkgate-delta /usr/local/bin/chunkgate-delta
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 

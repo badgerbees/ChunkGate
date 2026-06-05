@@ -64,6 +64,21 @@ func validateUploadID(uploadID string) bool {
 	return true
 }
 
+func validateChunkHash(hash string) bool {
+	if len(hash) != 64 {
+		return false
+	}
+	for _, r := range hash {
+		switch {
+		case r >= 'a' && r <= 'f':
+		case r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func parsePartNumber(raw string) (int, bool) {
 	if raw == "" {
 		return 0, false

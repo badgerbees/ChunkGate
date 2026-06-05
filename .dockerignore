@@ -4,6 +4,8 @@ data
 tmp
 chunkgate
 chunkgate.exe
+chunkgate-delta
+chunkgate-delta.exe
 *.db
 *.db-shm
 *.db-wal
